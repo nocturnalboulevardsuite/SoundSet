@@ -1543,14 +1543,63 @@ div[data-baseweb="tab-list"] button[aria-selected="true"] p { color: #ffa04d; }
   background: #2a211c; color: #d9cfc6; border: 1px solid #3a2e27; }
 .ss-badge.orange { background: #ff6a00; color: #1a1613; border-color: #ff6a00; }
 /* planes */
-.ss-plan { border: 1px solid #2f2621; border-radius: 22px; padding: 1.4rem 1.4rem .6rem; background: #17120f;
-  box-sizing: border-box; height: 24rem !important; margin-bottom: .7rem; }
-.ss-plan.current { border: 2px solid #ff6a00; }
-.ss-plan h3 { margin: 0; padding: 0; font-weight: 700; }
-.ss-plan .pr { font-size: 2.2rem; font-weight: 800; color: #ff8a2a; margin: .3rem 0 .1rem; }
-.ss-plan .pr small { font-size: .95rem; color: #9a8f86; font-weight: 500; }
-.ss-plan ul { padding-left: 1.1rem; margin: .8rem 0; color: #d9cfc6; }
-.ss-plan li { margin: .35rem 0; }
+/* cada columna estira su tarjeta para que las tres midan lo mismo; en celular se apilan con su botón */
+[data-testid="stHorizontalBlock"]:has(.ss-plan) { position: relative; z-index: 0; align-items: stretch;
+  flex-wrap: wrap; container-type: inline-size; }
+@container (max-width: 760px) {
+  [data-testid="stColumn"]:has(.ss-plan) { flex: 1 1 100% !important; min-width: 100% !important; margin-bottom: .6rem; }
+}
+[data-testid="stColumn"]:has(.ss-plan) > [data-testid="stVerticalBlock"] { height: 100%; }
+[data-testid="stElementContainer"]:has(.ss-plan) { flex: 1 1 auto; }
+[data-testid="stElementContainer"]:has(.ss-plan) div:has(.ss-plan) { height: 100%; align-items: stretch; }
+.ss-plan { position: relative; box-sizing: border-box; height: 100%; display: flex; flex-direction: column; border-radius: 22px;
+  padding: 1.5rem 1.5rem 1.4rem; background: #151110; border: 1px solid #2a2320; }
+.ss-plan h3 { margin: 0; padding: 0; font-size: 1.45rem; font-weight: 700; color: #f4efe9; }
+.ss-plan.has-cur h3 { padding-right: 4.4rem; }
+.ss-plan, .ss-plan * { word-break: normal; overflow-wrap: normal; }
+.ss-plan .tg { color: #8d847d; font-size: .9rem; margin-top: .1rem; }
+.ss-plan .pr { font-size: 2.5rem; font-weight: 800; line-height: 1.1; margin: .9rem 0 0; color: #f4efe9; }
+.ss-plan .pr small { font-size: .95rem; font-weight: 500; color: #8d847d; -webkit-text-fill-color: #8d847d; }
+.ss-plan ul { list-style: none; padding: 1.1rem 0 0; margin: 1.1rem 0 0; border-top: 1px solid #2a2320;
+  display: flex; flex-direction: column; gap: .7rem; }
+.ss-plan li { position: relative; padding-left: 1.75rem; margin: 0; color: #d9cfc6; line-height: 1.4; font-size: .98rem; }
+.ss-plan li::before { content: "✓"; position: absolute; left: 0; top: .1rem; width: 1.15rem; height: 1.15rem;
+  border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: .7rem;
+  font-weight: 800; background: var(--dot, #3a322d); color: var(--dot-ink, #f4efe9); }
+.ss-plan .cur { position: absolute; top: 1.25rem; right: 1.2rem; font-size: .75rem; font-weight: 600;
+  padding: .15rem .65rem; border-radius: 999px; background: #2a2320; color: #f4efe9; }
+/* Premium: dorado */
+.ss-plan.gold { border: 1.5px solid transparent;
+  background: linear-gradient(160deg, #1d170d, #141009) padding-box,
+              linear-gradient(135deg, #f9e29c, #c9962b 40%, #f5d27a 65%, #9c6e17) border-box;
+  box-shadow: 0 0 34px rgba(212, 175, 55, .12); --dot: #e3bd59; --dot-ink: #1d170d; }
+.ss-plan.gold h3 { color: #f5d27a; }
+.ss-plan.gold .pr { background: linear-gradient(90deg, #f9e29c, #d4af37, #f5d27a);
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.ss-plan.gold ul { border-top-color: #3a2f18; }
+.ss-plan.gold .cur { background: #e3bd59; color: #1d170d; }
+/* SoundSet: borde RGBIC */
+.ss-plan.rgb { border: 2px solid transparent;
+  background: linear-gradient(#151110, #151110) padding-box,
+              linear-gradient(90deg, #d4af37, #e53935, #ff6d00, #8e24aa, #1e6fe0, #d4af37) border-box;
+  background-size: 100% 100%, 300% 100%; animation: ss-rgb 6s linear infinite; --dot: #ff6d00; --dot-ink: #151110; }
+.ss-plan.rgb::before { content: ""; position: absolute; inset: -2px; border-radius: inherit; z-index: -1;
+  background: linear-gradient(90deg, #d4af37, #e53935, #ff6d00, #8e24aa, #1e6fe0, #d4af37);
+  background-size: 300% 100%; filter: blur(20px); opacity: .32; animation: ss-rgb-glow 6s linear infinite; }
+.ss-plan.rgb .pr { background: linear-gradient(90deg, #d4af37, #e53935, #ff6d00, #8e24aa, #1e6fe0, #d4af37);
+  background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: ss-rgb-glow 6s linear infinite; }
+.ss-plan.rgb .cur { background: linear-gradient(90deg, #e53935, #8e24aa); color: #fff; }
+@keyframes ss-rgb { to { background-position: 0 0, 300% 0; } }
+@keyframes ss-rgb-glow { to { background-position: 300% 0; } }
+.st-key-plan_premium button { background: linear-gradient(135deg, #f5d27a, #c9962b) !important; border: none !important;
+  color: #1d170d !important; font-weight: 700 !important; }
+.st-key-plan_soundset button { border: none !important; color: #fff !important; font-weight: 700 !important;
+  background: linear-gradient(90deg, #d4af37, #e53935, #ff6d00, #8e24aa, #1e6fe0, #d4af37) !important;
+  background-size: 300% 100% !important; animation: ss-rgb-glow 6s linear infinite;
+  text-shadow: 0 1px 2px rgba(0,0,0,.45); }
+@media (prefers-reduced-motion: reduce) { .ss-plan.rgb, .ss-plan.rgb::before, .ss-plan.rgb .pr,
+  .st-key-plan_soundset button { animation: none !important; } }
 .st-key-hide_ui { display: none; }
 #MainMenu, footer { visibility: hidden; }
 </style>
@@ -2378,14 +2427,15 @@ def page_home(me: dict, buttons: list[dict]) -> None:
 
 # ================================================================== PLANES
 PLAN_FEATURES = {
-    "free": ["Hasta 20 sonidos", PLANS["free"]["quality"], "Publica gratis en Comunidad",
+    "free": ["Hasta 20 sonidos", "Calidad intermedia: 352 kbps", "Publica gratis en Comunidad",
              "Pide sonidos en Imaginación"],
-    "premium": ["Hasta 100 sonidos", PLANS["premium"]["quality"],
-                "Token para OBS: tus sonidos se activan con puntos del canal de Twitch",
-                "Cobra por la descarga de tus sonidos en Comunidad"],
-    "soundset": ["Sonidos ilimitados", PLANS["soundset"]["quality"], "Todo lo de Premium: OBS y ventas",
-                 "Modo artista: ve las burbujas de Imaginación y cobra por crear sonidos"],
+    "premium": ["Hasta 100 sonidos", "Calidad CD: 1411 kbps", "Token para OBS y puntos del canal",
+                "Cobra por la descarga de tus sonidos"],
+    "soundset": ["Sonidos ilimitados", "Calidad CD: 1411 kbps", "Todo lo de Premium: OBS y ventas",
+                 "Modo artista: cobra por crear sonidos en Imaginación"],
 }
+PLAN_STYLE = {"free": ("", "Para empezar"), "premium": ("gold", "Para streamers"),
+              "soundset": ("rgb", "Para artistas y creadores")}
 
 
 def page_plans(me: dict) -> None:
@@ -2394,12 +2444,15 @@ def page_plans(me: dict) -> None:
     if cur != "free":
         exp = date.fromisoformat(me["plan_expires"]).strftime("%d-%m-%Y")
         st.caption(f"Tu plan {PLANS[cur]['name']} está activo hasta el {exp}.")
-    cols = st.columns(3, gap="medium")
+    cols = st.columns(3, gap="small")
     for col, (key, p) in zip(cols, PLANS.items()):
         with col:
+            cls, tagline = PLAN_STYLE[key]
             price = "Gratis" if not p["price"] else f"US${p['price']}<small> / año</small>"
             items = "".join(f"<li>{esc(f)}</li>" for f in PLAN_FEATURES[key])
-            st.markdown(f'<div class="ss-plan{" current" if key == cur else ""}"><h3>{p["name"]}</h3>'
+            badge = '<span class="cur">Tu plan</span>' if key == cur else ""
+            cls += " has-cur" if key == cur else ""
+            st.markdown(f'<div class="ss-plan {cls}">{badge}<h3>{p["name"]}</h3><div class="tg">{tagline}</div>'
                         f'<div class="pr">{price}</div><ul>{items}</ul></div>', unsafe_allow_html=True)
             if key == cur:
                 if p["price"] and st.button("Renovar 1 año", key=f"plan_{key}", width="stretch",
