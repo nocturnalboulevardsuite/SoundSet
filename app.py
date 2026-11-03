@@ -75,13 +75,13 @@ COLORS = {
     "Negro": "#1c1a19",
 }
 
-PAGES = [
-    ":material/grid_view: Mi SoundPad",
-    ":material/add_circle: Agregar botón",
-    ":material/tune: Editar botones",
-    ":material/groups: Comunidad",
-    ":material/person: Mi perfil",
-]
+PAGE_PAD = ":material/grid_view: Mi SoundPad"
+PAGE_COMMUNITY = ":material/groups: Comunidad"
+PAGE_ADD = ":material/add_circle: Agregar botón"
+PAGE_EDIT = ":material/tune: Editar botones"
+PAGE_PROFILE = ":material/person: Mi perfil"
+# Comunidad va justo debajo de Mi SoundPad para llegar más rápido
+PAGES = [PAGE_PAD, PAGE_COMMUNITY, PAGE_ADD, PAGE_EDIT, PAGE_PROFILE]
 
 st.set_page_config(
     page_title="SoundSet",
@@ -1032,6 +1032,26 @@ APP_CSS = """
 .ss-stats span { color: #9a8f86; font-size: .82rem; }
 .ss-author { display: flex; align-items: center; gap: 8px; color: #d9cfc6; font-size: .92rem; margin: .1rem 0 .2rem; }
 div[data-baseweb="tab-list"] button[aria-selected="true"] p { color: #ffa04d; }
+/* modo edición del SoundPad */
+.ss-tile { --c: #ff6a00; aspect-ratio: 1 / 1; border-radius: 22px; border: 1px solid rgba(255,255,255,.07);
+  background: linear-gradient(160deg, color-mix(in srgb, var(--c) 88%, #fff 12%), color-mix(in srgb, var(--c) 68%, #000));
+  box-shadow: 0 8px 18px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.2);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+  animation: ss-wiggle 1.6s ease-in-out infinite; margin-bottom: .2rem; }
+.ss-tile:nth-child(odd) { animation-delay: -.8s; }
+.ss-tile .ic { width: 48%; aspect-ratio: 1 / 1; border-radius: 50%; background: rgba(0,0,0,.17); display: flex;
+  align-items: center; justify-content: center; color: #fff; overflow: hidden; }
+.ss-tile .ic svg { width: 52%; height: 52%; }
+.ss-tile .ic img { width: 100%; height: 100%; object-fit: cover; }
+.ss-tile .nm { font-weight: 600; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.5); max-width: 90%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ss-tile.add { background: transparent; border: 2px dashed #4a3a30; box-shadow: none; animation: none; color: #9a8f86; }
+.ss-tile.add svg { width: 34%; height: 34%; }
+@keyframes ss-wiggle { 0%, 100% { transform: rotate(-.6deg); } 50% { transform: rotate(.6deg); } }
+@media (prefers-reduced-motion: reduce) { .ss-tile { animation: none; } }
+[class*="st-key-del_"] button { border-color: #5a1f1c !important; color: #ff5a52 !important; }
+[class*="st-key-del_"] button:hover { background: #e5322b !important; border-color: #e5322b !important; color: #fff !important; }
+.st-key-dlg_del button { background: #e5322b !important; border: none !important; color: #fff !important; }
 #MainMenu, footer { visibility: hidden; }
 </style>
 """
@@ -1158,8 +1178,85 @@ def sidebar(me: dict, n_buttons: int) -> str:
     return page
 
 
-def page_pad(buttons: list[dict]) -> None:
-    st.markdown("## Mi SoundPad")
+def go_to(page: str) -> None:
+    """Cambia de sección desde un botón (se usa como callback, antes de dibujar el menú)."""
+    st.session_state.page = page
+
+
+def page_header(title: str, target: str, label: str, icon: str) -> None:
+    """Título de la página con un acceso rápido a otra sección a la derecha."""
+    t, b = st.columns([4, 1.2], vertical_alignment="bottom")
+    t.markdown(f"## {title}")
+    b.button(label, icon=icon, on_click=go_to, args=(target,), width="stretch", key=f"go_{title}")
+
+
+def open_editor(bid: int) -> None:
+    """Lápiz del modo edición: abre Editar botones con ese botón ya elegido."""
+    st.session_state.page = PAGE_EDIT
+    st.session_state.edit_sel = bid
+
+
+@st.dialog("Eliminar botón")
+def confirm_delete(uid: int, b: dict) -> None:
+    st.markdown(f"¿Quieres eliminar **{esc(b['name'])}** de tu SoundPad? Esta acción no se puede deshacer.")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancelar", key="dlg_cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Eliminar", key="dlg_del", icon=":material/delete:", width="stretch"):
+        delete_button(uid, b["id"])
+        st.session_state.pop("edit_sel", None)
+        flash(f"Botón «{b['name']}» eliminado.", ":material/delete:")
+        st.rerun()
+
+
+def tile_html(b: dict) -> str:
+    if b.get("image_b64"):
+        inner = f'<img src="data:{esc(b.get("image_mime"))};base64,{b["image_b64"]}" alt="">'
+    else:
+        inner = icon_svg(b.get("icon"))
+    return (f'<div class="ss-tile" style="--c:{esc(b.get("color"))}"><div class="ic">{inner}</div>'
+            f'<div class="nm">{esc(b["name"])}</div></div>')
+
+
+ADD_TILE = ('<div class="ss-tile add"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><div>Nuevo botón</div></div>')
+
+
+def render_edit_grid(me: dict, buttons: list[dict], per_row: int = 5) -> None:
+    st.markdown('<p class="ss-muted">Toca el lápiz para editar un botón o el basurero para eliminarlo. '
+                'Desactiva el modo edición para volver a tocar los sonidos.</p>', unsafe_allow_html=True)
+    items: list[dict | None] = [*buttons, None]  # None = casilla para agregar un botón nuevo
+    for r in range(0, len(items), per_row):
+        cols = st.columns(per_row, gap="small")
+        for col, b in zip(cols, items[r:r + per_row]):
+            with col:
+                if b is None:
+                    st.markdown(ADD_TILE, unsafe_allow_html=True)
+                    st.button("Agregar", key="tile_add", icon=":material/add:", on_click=go_to,
+                              args=(PAGE_ADD,), width="stretch")
+                    continue
+                st.markdown(tile_html(b), unsafe_allow_html=True)
+                left, right = st.columns(2, gap="small")
+                left.button("", key=f"edit_{b['id']}", icon=":material/edit:", help="Editar",
+                            on_click=open_editor, args=(b["id"],), width="stretch")
+                if right.button("", key=f"del_{b['id']}", icon=":material/delete:", help="Eliminar",
+                                width="stretch"):
+                    confirm_delete(me["id"], b)
+
+
+def page_pad(me: dict, buttons: list[dict]) -> None:
+    t, a, e, c = st.columns([3, 1.3, 1.3, 1.2], vertical_alignment="bottom")
+    t.markdown("## Mi SoundPad")
+    a.button("Agregar botón", key="pad_add", icon=":material/add:", type="primary", on_click=go_to,
+             args=(PAGE_ADD,), width="stretch")
+    edit_mode = e.toggle("Modo edición", key="edit_mode")
+    c.button("Comunidad", key="pad_com", icon=":material/groups:", on_click=go_to, args=(PAGE_COMMUNITY,),
+             width="stretch")
+
+    if edit_mode:
+        render_edit_grid(me, buttons)
+        return
+
     st.markdown('<p class="ss-muted">Aprieta los botones todas las veces que quieras: los sonidos se acumulan.</p>',
                 unsafe_allow_html=True)
     payload = [button_payload(b) for b in buttons]
@@ -1169,7 +1266,7 @@ def page_pad(buttons: list[dict]) -> None:
 
 def page_add(user: dict) -> None:
     v = st.session_state.setdefault("add_ver", 0)
-    st.markdown("## Agregar botón")
+    page_header("Agregar botón", PAGE_PAD, "Mi SoundPad", ":material/grid_view:")
     c1, c2 = st.columns(2, gap="large")
     with c1:
         name = st.text_input("Nombre del botón", max_chars=24, key=f"add_name_{v}", placeholder="Ej: Risa malvada")
@@ -1213,7 +1310,7 @@ def page_add(user: dict) -> None:
 
 def page_edit(user: dict, buttons: list[dict]) -> None:
     v = st.session_state.setdefault("edit_ver", 0)
-    st.markdown("## Editar botones")
+    page_header("Editar botones", PAGE_PAD, "Mi SoundPad", ":material/grid_view:")
     if not buttons:
         st.info("Tu set está vacío. Agrega un botón nuevo, guarda uno de la comunidad o recupera los de ejemplo.")
         if st.button("Recuperar los 10 botones de ejemplo", type="primary", icon=":material/restore:"):
@@ -1357,7 +1454,7 @@ def community_card(item: dict, me: dict) -> None:
 
 
 def page_community(me: dict, buttons: list[dict]) -> None:
-    st.markdown("## Comunidad")
+    page_header("Comunidad", PAGE_PAD, "Mi SoundPad", ":material/grid_view:")
     st.markdown('<p class="ss-muted">Escucha los botones que comparte la gente, guárdalos en tu set o descarga '
                 'el audio.</p>', unsafe_allow_html=True)
 
@@ -1478,6 +1575,8 @@ def main() -> None:
     init_db()
     st.markdown(APP_CSS, unsafe_allow_html=True)
     st.session_state.setdefault("stop_nonce", 0)
+    if "edit_mode" in st.session_state:  # mantiene el modo edición al ir y volver de otra sección
+        st.session_state.edit_mode = st.session_state.edit_mode
 
     session_user = st.session_state.get("user")
     me = get_user(session_user["id"]) if session_user else None
@@ -1491,17 +1590,16 @@ def main() -> None:
     page = sidebar(me, len(buttons))
     show_flash()
 
-    idx = PAGES.index(page) if page in PAGES else 0
-    if idx == 0:
-        page_pad(buttons)
-    elif idx == 1:
-        page_add(me)
-    elif idx == 2:
-        page_edit(me, buttons)
-    elif idx == 3:
+    if page == PAGE_COMMUNITY:
         page_community(me, buttons)
-    else:
+    elif page == PAGE_ADD:
+        page_add(me)
+    elif page == PAGE_EDIT:
+        page_edit(me, buttons)
+    elif page == PAGE_PROFILE:
         page_profile(me)
+    else:
+        page_pad(me, buttons)
 
 
 main()
