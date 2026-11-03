@@ -484,6 +484,27 @@ def init_db() -> bool:
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                artist_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                sender_id INTEGER,
+                text TEXT NOT NULL,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS message_reads(
+                user_id INTEGER NOT NULL,
+                request_id INTEGER NOT NULL,
+                artist_id INTEGER NOT NULL,
+                last_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, request_id, artist_id)
+            );
+            CREATE TABLE IF NOT EXISTS request_views(
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                state TEXT NOT NULL,
+                PRIMARY KEY (user_id, request_id)
+            );
             CREATE TABLE IF NOT EXISTS community_saves(
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 item_id INTEGER NOT NULL REFERENCES community(id) ON DELETE CASCADE,
@@ -808,7 +829,7 @@ def list_community(uid: int, query: str, order: str, only_mine: bool) -> list[di
     }
     like = f"%{query.strip()}%"
     sql = (
-        "SELECT c.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.bio, "
+        "SELECT c.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.bio, u.plan, u.plan_expires, "
         " (SELECT COUNT(*) FROM community_saves s WHERE s.item_id = c.id) AS saves, "
         " EXISTS(SELECT 1 FROM community_saves s WHERE s.item_id = c.id AND s.user_id = ?) AS saved_by_me, "
         " EXISTS(SELECT 1 FROM purchases p WHERE p.item_id = c.id AND p.user_id = ?) AS bought_by_me "
@@ -854,7 +875,7 @@ def create_request(uid: int, text: str, kind: str, budget: float | None, currenc
                     (uid, text, kind, budget, currency, color))
 
 
-_REQ_SELECT = ("SELECT r.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime "
+_REQ_SELECT = ("SELECT r.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.plan, u.plan_expires "
                "FROM requests r JOIN users u ON u.id = r.user_id ")
 
 
@@ -877,7 +898,7 @@ def count_open_requests() -> int:
 def my_requests(uid: int) -> list[dict]:
     with db() as con:
         rows = con.execute(
-            "SELECT r.*, u.username, u.display_name, a.username AS artist_username FROM requests r "
+            "SELECT r.*, u.username, u.display_name, u.plan, u.plan_expires, a.username AS artist_username FROM requests r "
             "JOIN users u ON u.id = r.user_id LEFT JOIN users a ON a.id = r.artist_id "
             "WHERE r.user_id = ? AND r.status != 'closed' ORDER BY r.id DESC", (uid,)).fetchall()
     return [dict(r) for r in rows]
@@ -893,7 +914,7 @@ def save_request_sound(uid: int, username: str, req: dict) -> None:
 def request_offers(req_id: int) -> list[dict]:
     with db() as con:
         rows = con.execute(
-            "SELECT o.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.bio FROM offers o "
+            "SELECT o.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.bio, u.plan, u.plan_expires FROM offers o "
             "JOIN users u ON u.id = o.artist_id WHERE o.request_id = ? AND o.status = 'pending' ORDER BY o.id",
             (req_id,)).fetchall()
     return [dict(r) for r in rows]
@@ -948,7 +969,7 @@ def artist_jobs(artist_id: int) -> list[dict]:
     with db() as con:
         rows = con.execute(
             "SELECT o.id AS offer_id, o.amount, o.currency, o.message, o.status AS offer_status, r.*, "
-            "u.username, u.display_name FROM offers o JOIN requests r ON r.id = o.request_id "
+            "u.username, u.display_name, u.plan, u.plan_expires FROM offers o JOIN requests r ON r.id = o.request_id "
             "JOIN users u ON u.id = r.user_id WHERE o.artist_id = ? AND o.status IN ('pending', 'accepted', 'rejected') "
             "ORDER BY o.id DESC", (artist_id,)).fetchall()
     return [dict(r) for r in rows]
@@ -963,6 +984,93 @@ def deliver_request(artist_id: int, req_id: int, uploaded) -> None:
                     (f"sounds/requests/{name}", req_id, artist_id))
         con.execute("UPDATE payments SET status = 'released' WHERE kind = 'request' AND ref_id = ? AND status = 'held'",
                     (req_id,))
+
+
+def get_request(req_id: int) -> dict | None:
+    with db() as con:
+        row = con.execute(_REQ_SELECT + "WHERE r.id = ?", (req_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def field_requests(uid: int) -> list[dict]:
+    """Burbujas abiertas (también las tuyas), sin las que pasaste, marcando si ya la tomaste."""
+    with db() as con:
+        rows = con.execute(
+            _REQ_SELECT.replace("FROM", ", EXISTS(SELECT 1 FROM offers o WHERE o.request_id = r.id AND o.artist_id = ? "
+                                        "AND o.status IN ('pending', 'accepted')) AS offered FROM")
+            + "WHERE r.status = 'open' AND NOT EXISTS(SELECT 1 FROM request_views v WHERE v.user_id = ? "
+              "AND v.request_id = r.id AND v.state = 'dismissed') ORDER BY r.id DESC", (uid, uid)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def next_unseen_request(uid: int) -> dict | None:
+    """Siguiente burbuja para la notificación: de otra persona, de los últimos 3 días y que no hayas visto."""
+    with db() as con:
+        row = con.execute(
+            _REQ_SELECT + "WHERE r.status = 'open' AND r.user_id != ? AND r.created_at >= datetime('now', '-3 days') "
+            "AND NOT EXISTS(SELECT 1 FROM request_views v WHERE v.user_id = ? AND v.request_id = r.id) "
+            "AND NOT EXISTS(SELECT 1 FROM offers o WHERE o.request_id = r.id AND o.artist_id = ?) "
+            "ORDER BY r.id DESC LIMIT 1", (uid, uid, uid)).fetchone()
+    return dict(row) if row else None
+
+
+def mark_view(uid: int, req_id: int, state: str) -> None:
+    with db() as con:
+        con.execute("INSERT INTO request_views(user_id, request_id, state) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id, request_id) DO UPDATE SET state = excluded.state", (uid, req_id, state))
+
+
+def get_offer(req_id: int, artist_id: int) -> dict | None:
+    with db() as con:
+        row = con.execute("SELECT * FROM offers WHERE request_id = ? AND artist_id = ? ORDER BY id DESC LIMIT 1",
+                          (req_id, artist_id)).fetchone()
+    return dict(row) if row else None
+
+
+# ------------------------------------------------------------------ chat entre quien pide y el artista
+def add_message(req_id: int, artist_id: int, sender_id: int | None, text: str, actor_id: int | None = None) -> None:
+    """sender_id None = aviso del sistema; actor_id es quien lo provocó (para no contárselo como no leído)."""
+    from datetime import datetime
+    with db() as con:
+        cur = con.execute("INSERT INTO messages(request_id, artist_id, sender_id, text, created_at) VALUES (?, ?, ?, ?, ?)",
+                          (req_id, artist_id, sender_id, text, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        msg_id = cur.lastrowid
+    reader = sender_id or actor_id
+    if reader:
+        mark_read(reader, req_id, artist_id, msg_id)
+
+
+def get_messages(req_id: int, artist_id: int) -> list[dict]:
+    with db() as con:
+        rows = con.execute("SELECT * FROM messages WHERE request_id = ? AND artist_id = ? ORDER BY id",
+                           (req_id, artist_id)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_read(uid: int, req_id: int, artist_id: int, last_id: int) -> None:
+    with db() as con:
+        con.execute("INSERT INTO message_reads(user_id, request_id, artist_id, last_id) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(user_id, request_id, artist_id) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)",
+                    (uid, req_id, artist_id, last_id))
+
+
+def my_threads(uid: int) -> list[dict]:
+    with db() as con:
+        rows = con.execute(
+            "SELECT t.*, r.text AS req_text, r.color, r.status, r.user_id AS owner_id, "
+            " (SELECT text FROM messages x WHERE x.id = t.last_id) AS last_text, "
+            " (SELECT COUNT(*) FROM messages y WHERE y.request_id = t.request_id AND y.artist_id = t.artist_id "
+            "   AND (y.sender_id IS NULL OR y.sender_id != ?) AND y.id > COALESCE((SELECT k.last_id FROM message_reads k "
+            "   WHERE k.user_id = ? AND k.request_id = t.request_id AND k.artist_id = t.artist_id), 0)) AS unread "
+            "FROM (SELECT request_id, artist_id, MAX(id) AS last_id FROM messages GROUP BY request_id, artist_id) t "
+            "JOIN requests r ON r.id = t.request_id "
+            "WHERE r.user_id = ? OR t.artist_id = ? ORDER BY t.last_id DESC",
+            (uid, uid, uid, uid)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def unread_total(uid: int) -> int:
+    return sum(t["unread"] for t in my_threads(uid))
 
 
 # ------------------------------------------------------------------ OBS
@@ -1486,7 +1594,7 @@ APP_CSS = """
 .ss-me-name { font-weight: 600; font-size: 1.05rem; color: #f4efe9; line-height: 1.2; }
 .ss-avatar { border-radius: 50%; object-fit: cover; flex: none; display: inline-flex; align-items: center;
   justify-content: center; background: #ff6a00; color: #1a1613; font-weight: 700; }
-.ss-profile { display: flex; flex-direction: column; align-items: center; text-align: center; gap: .35rem; padding: .6rem 0; }
+.ss-profile { position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; gap: .35rem; padding: .6rem 0; }
 .ss-profile h3 { margin: .4rem 0 0; padding: 0; }
 .ss-bio { color: #d9cfc6; margin-top: .5rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .ss-stats { display: flex; gap: 1.6rem; justify-content: center; margin-top: .9rem; }
@@ -1515,6 +1623,67 @@ div[data-baseweb="tab-list"] button[aria-selected="true"] p { color: #ffa04d; }
 [class*="st-key-del_"] button { border-color: #5a1f1c !important; color: #ff5a52 !important; }
 [class*="st-key-del_"] button:hover { background: #e5322b !important; border-color: #e5322b !important; color: #fff !important; }
 .st-key-dlg_del button { background: #e5322b !important; border: none !important; color: #fff !important; }
+/* verificado RGBIC */
+.ss-verified { position: relative; display: inline-block; vertical-align: -2px; margin-left: 4px; flex: none; }
+.ss-verified::before, .ss-verified::after { content: ""; position: absolute; inset: 0;
+  -webkit-mask-size: 100% 100%; mask-size: 100% 100%; }
+.ss-verified::before { background: linear-gradient(90deg, #d4af37, #e53935, #ff6d00, #8e24aa, #1e6fe0, #d4af37);
+  background-size: 300% 100%; animation: ss-rgb-glow 4s linear infinite;
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Cpath%20d%3D%27M12%201.6%2014.3%203.5%2017.2%203%2018.3%205.7%2021%206.8%2020.5%209.7%2022.4%2012%2020.5%2014.3%2021%2017.2%2018.3%2018.3%2017.2%2021%2014.3%2020.5%2012%2022.4%209.7%2020.5%206.8%2021%205.7%2018.3%203%2017.2%203.5%2014.3%201.6%2012%203.5%209.7%203%206.8%205.7%205.7%206.8%203%209.7%203.5Z%27/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Cpath%20d%3D%27M12%201.6%2014.3%203.5%2017.2%203%2018.3%205.7%2021%206.8%2020.5%209.7%2022.4%2012%2020.5%2014.3%2021%2017.2%2018.3%2018.3%2017.2%2021%2014.3%2020.5%2012%2022.4%209.7%2020.5%206.8%2021%205.7%2018.3%203%2017.2%203.5%2014.3%201.6%2012%203.5%209.7%203%206.8%205.7%205.7%206.8%203%209.7%203.5Z%27/%3E%3C/svg%3E"); }
+.ss-verified::after { background: #fff; -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Cpath%20d%3D%27M7.6%2012.4l3%203%205.8-6.3%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%272.6%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Cpath%20d%3D%27M7.6%2012.4l3%203%205.8-6.3%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%272.6%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27/%3E%3C/svg%3E"); }
+.ss-av { position: relative; display: inline-flex; flex: none; width: var(--s); height: var(--s); border-radius: 50%; }
+.ss-av.paid { padding: max(2px, calc(var(--s) * .04)); background: linear-gradient(90deg, #d4af37, #e53935, #ff6d00, #8e24aa, #1e6fe0, #d4af37);
+  background-size: 300% 100%; animation: ss-rgb-glow 4s linear infinite; }
+.ss-av.paid .ss-avatar { border: 2px solid #15110f; box-sizing: border-box; }
+.ss-av-badge { position: absolute !important; right: -3px; bottom: -3px; margin: 0 !important;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
+.ss-corner-verified { position: absolute; top: .2rem; right: .2rem; }
+/* burbujas flotantes */
+.ss-orb { --b: #e53935; width: 100%; max-width: 190px; aspect-ratio: 1 / 1; margin: .9rem auto .6rem; border-radius: 50%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+  padding: 1.1rem; box-sizing: border-box; cursor: default;
+  background: radial-gradient(circle at 30% 24%, rgba(255,255,255,.28), rgba(255,255,255,0) 26%),
+              radial-gradient(circle at 70% 80%, color-mix(in srgb, var(--b) 30%, transparent), transparent 55%),
+              color-mix(in srgb, var(--b) 16%, #14100e);
+  border: 1.5px solid color-mix(in srgb, var(--b) 50%, transparent);
+  color: color-mix(in srgb, var(--b) 68%, #d6ccc4);
+  box-shadow: inset 0 0 26px color-mix(in srgb, var(--b) 28%, transparent), 0 12px 26px rgba(0,0,0,.35);
+  animation: ss-drift var(--d, 7s) ease-in-out infinite; animation-delay: var(--dl, 0s); }
+.ss-orb p { font-weight: 600; font-size: .86rem; line-height: 1.3; margin: 0 0 .35rem; color: inherit;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.ss-orb .meta { font-size: .7rem; color: color-mix(in srgb, var(--b) 45%, #9a8f86); line-height: 1.35; }
+.ss-orb .meta b { color: color-mix(in srgb, var(--b) 75%, #e8ddd5); display: block; }
+.ss-orb.sm { max-width: 64px; padding: 0; margin: 0; flex: none; }
+@keyframes ss-drift {
+  0% { transform: translate(0, 0) scale(1); }
+  25% { transform: translate(5px, -9px) scale(1.025); }
+  50% { transform: translate(-4px, -15px) scale(.99); }
+  75% { transform: translate(-6px, -6px) scale(1.015); }
+  100% { transform: translate(0, 0) scale(1); } }
+.ss-mine { text-align: center; color: #9a8f86; font-size: .82rem; }
+/* notificación que cae desde arriba */
+[class*="st-key-bubble_notif_"] { position: fixed !important; top: 4rem; left: 50%; transform: translateX(-50%);
+  z-index: 999990; width: min(470px, 92vw) !important; background: #18120f; border: 1px solid #3a2e27;
+  border-radius: 22px; padding: .9rem 1rem .8rem; box-shadow: 0 18px 44px rgba(0,0,0,.6);
+  animation: ss-drop .7s cubic-bezier(.2, .9, .3, 1.25); }
+@keyframes ss-drop { from { transform: translate(-50%, -160%); opacity: 0; } }
+.ss-notif { display: flex; gap: .9rem; align-items: center; margin-bottom: .55rem; }
+.ss-notif .tx { min-width: 0; }
+.ss-notif .tt { font-size: .75rem; color: #ff8a2a; font-weight: 600; }
+.ss-notif .q { color: #f4efe9; font-weight: 600; line-height: 1.35; margin: .1rem 0 .2rem;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+/* chat */
+.ss-chat { display: flex; flex-direction: column-reverse; gap: .45rem; height: 380px; overflow-y: auto; padding: .9rem;
+  background: #120f0d; border: 1px solid #2a2320; border-radius: 16px; }
+.ss-msg { align-self: flex-start; max-width: 78%; background: #241c18; color: #efe7e0; padding: .5rem .8rem;
+  border-radius: 16px 16px 16px 4px; white-space: pre-wrap; word-break: break-word; line-height: 1.4; }
+.ss-msg.me { align-self: flex-end; background: #ff6a00; color: #1a1613; border-radius: 16px 16px 4px 16px; }
+.ss-msg.sys { align-self: center; background: transparent; color: #9a8f86; font-size: .85rem; border: 1px dashed #3a2e27; }
+.ss-msg span { display: block; font-size: .68rem; opacity: .6; margin-top: .15rem; text-align: right; }
+.ss-chat-head { display: flex; align-items: center; gap: .7rem; margin-bottom: .6rem; }
+.ss-chat-head b { color: #f4efe9; }
+@media (prefers-reduced-motion: reduce) { .ss-orb, [class*="st-key-bubble_notif_"], .ss-av.paid,
+  .ss-verified::before { animation: none !important; } }
 /* burbujas de Imaginación */
 .ss-bubble { --b: #e53935; position: relative; padding: 1.4rem 1.6rem 1.1rem; margin: .4rem 0 .6rem;
   background: color-mix(in srgb, var(--b) 15%, #14100e);
@@ -1611,14 +1780,30 @@ def logo(size: int = 30) -> None:
                 f'<span>Sound<b>Set</b></span></div>', unsafe_allow_html=True)
 
 
+def is_verified(u: dict) -> bool:
+    """Cualquier plan pagado y vigente da el verificado RGBIC."""
+    return active_plan(u) != "free"
+
+
+def verified_html(u: dict, size: int = 16) -> str:
+    if not is_verified(u):
+        return ""
+    return f'<i class="ss-verified" style="width:{size}px;height:{size}px" title="Verificado"></i>'
+
+
 def avatar_html(u: dict, size: int = 40) -> str:
     if u.get("avatar_b64"):
-        return (f'<img class="ss-avatar" src="data:{esc(u.get("avatar_mime"))};base64,{u["avatar_b64"]}" '
-                f'style="width:{size}px;height:{size}px" alt="">')
-    name = (u.get("display_name") or u.get("username") or "?").strip()
-    initials = "".join(p[0] for p in name.split()[:2]).upper() or "?"
-    return (f'<span class="ss-avatar" style="width:{size}px;height:{size}px;font-size:{size * 0.4:.0f}px">'
-            f'{esc(initials)}</span>')
+        inner = (f'<img class="ss-avatar" src="data:{esc(u.get("avatar_mime"))};base64,{u["avatar_b64"]}" '
+                 f'style="width:100%;height:100%" alt="">')
+    else:
+        name = (u.get("display_name") or u.get("username") or "?").strip()
+        initials = "".join(p[0] for p in name.split()[:2]).upper() or "?"
+        inner = (f'<span class="ss-avatar" style="width:100%;height:100%;font-size:{size * 0.4:.0f}px">'
+                 f'{esc(initials)}</span>')
+    if not is_verified(u):
+        return f'<span class="ss-av" style="--s:{size}px">{inner}</span>'
+    badge = verified_html(u, max(12, int(size * 0.36))) if size >= 28 else ""
+    return f'<span class="ss-av paid" style="--s:{size}px">{inner}{badge.replace("ss-verified", "ss-verified ss-av-badge")}</span>'
 
 
 def flash(msg: str, icon: str = ":material/check_circle:") -> None:
@@ -1707,8 +1892,8 @@ def sidebar(me: dict, n_buttons: int) -> str:
         logo(26)
         st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
         st.markdown(
-            f'<div class="ss-me">{avatar_html(me, 44)}<div><div class="ss-me-name">'
-            f'{esc(me.get("display_name") or me["username"])}</div>'
+            f'<div class="ss-me">{avatar_html(me, 46)}<div><div class="ss-me-name">'
+            f'{esc(me.get("display_name") or me["username"])}{verified_html(me, 16)}</div>'
             f'<div class="ss-muted">@{esc(me["username"])}</div></div></div>',
             unsafe_allow_html=True,
         )
@@ -1720,6 +1905,9 @@ def sidebar(me: dict, n_buttons: int) -> str:
         offers = pending_offers_count(me["id"])
         if offers:
             st.caption(f"Tienes {offers} oferta(s) nueva(s) en Imaginación.")
+        unread = unread_total(me["id"])
+        if unread:
+            st.caption(f"Tienes {unread} mensaje(s) sin leer.")
         st.divider()
         page = st.radio("Menú", PAGES, key="page", label_visibility="collapsed")
         st.divider()
@@ -2002,7 +2190,7 @@ def community_card(item: dict, me: dict, n_buttons: int) -> None:
                                  st.session_state.stop_nonce), 112)
         author = item.get("display_name") or item["username"]
         st.markdown(
-            f'<div class="ss-author">{avatar_html(item, 24)}<span>{esc(author)} '
+            f'<div class="ss-author">{avatar_html(item, 26)}<span>{esc(author)}{verified_html(item, 14)} '
             f'<span class="ss-muted">@{esc(item["username"])}</span></span></div>',
             unsafe_allow_html=True,
         )
@@ -2039,7 +2227,7 @@ def community_card(item: dict, me: dict, n_buttons: int) -> None:
             )
         with c3.popover("", icon=":material/person:", help="Ver perfil del autor"):
             st.markdown(
-                f'<div class="ss-profile">{avatar_html(item, 72)}<h3>{esc(author)}</h3>'
+                f'<div class="ss-profile">{avatar_html(item, 72)}<h3>{esc(author)}{verified_html(item, 18)}</h3>'
                 f'<span class="ss-muted">@{esc(item["username"])}</span>'
                 f'<div class="ss-bio">{esc(item.get("bio")) or "Sin bio todavía."}</div></div>',
                 unsafe_allow_html=True,
@@ -2119,8 +2307,10 @@ def page_profile(me: dict) -> None:
     with c1:
         with st.container(border=True):
             st.markdown(
-                f'<div class="ss-profile">{avatar_html(me, 110)}'
-                f'<h3>{esc(me.get("display_name") or me["username"])}</h3>'
+                f'<div class="ss-profile">'
+                f'{verified_html(me, 30).replace("ss-verified", "ss-verified ss-corner-verified")}'
+                f'{avatar_html(me, 110)}'
+                f'<h3>{esc(me.get("display_name") or me["username"])}{verified_html(me, 20)}</h3>'
                 f'<span class="ss-muted">@{esc(me["username"])}</span>'
                 f'<span class="ss-muted">{esc(me.get("email")) or "Sin correo"}</span>'
                 f'<div class="ss-bio">{esc(me.get("bio")) or "Todavía no escribes tu bio."}</div>'
@@ -2191,12 +2381,142 @@ BUBBLE_NAMES = ["Rojo", "Naranja", "Amarillo", "Verde", "Cian", "Azul", "Índigo
 BUBBLE_COLORS = [COLORS[n] for n in BUBBLE_NAMES]
 
 
+def short(text: str, n: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def price_text(r: dict) -> str:
+    return f"Paga {fmt_money(r['budget'], r['currency'])}" if r["kind"] == "budget" else "Recibe ofertas"
+
+
+def orb_html(r: dict, small: bool = False) -> str:
+    """Burbuja redonda que flota; cada una con su propio ritmo para que no se muevan todas igual."""
+    dur = 6 + (r["id"] * 37 % 40) / 10
+    delay = -((r["id"] * 13) % 50) / 10
+    style = f'--b:{esc(r["color"])};--d:{dur:.1f}s;--dl:{delay:.1f}s'
+    if small:
+        return f'<div class="ss-orb sm" style="{style}"></div>'
+    return (f'<div class="ss-orb" style="{style}" title="{esc(r["text"])}"><p>{esc(r["text"])}</p>'
+            f'<div class="meta">@{esc(r["username"])}{verified_html(r, 12)}<b>{price_text(r)}</b></div></div>')
+
+
+# alias para el resto del código
 def bubble_html(r: dict, big: bool = False) -> str:
-    price = (f"Paga {fmt_money(r['budget'], r['currency'])}" if r["kind"] == "budget"
-             else "Recibe ofertas de precio")
-    return (f'<div class="ss-bubble{" big" if big else ""}" style="--b:{esc(r["color"])}">'
-            f'<p>{esc(r["text"])}</p><div class="meta"><span>@{esc(r["username"])}</span>'
-            f'<span class="price">{price}</span></div></div>')
+    return orb_html(r)
+
+
+def nav_later(**state) -> None:
+    """Guarda un cambio de sección para aplicarlo al inicio de la próxima ejecución."""
+    st.session_state.pending_nav = state
+
+
+def open_chat(req_id: int, artist_id: int) -> None:
+    st.session_state.page = PAGE_HOME
+    st.session_state.home_view = "Mensajes"
+    st.session_state.chat_thread = (req_id, artist_id)
+
+
+def start_take(is_artist: bool, req_id: int, uid: int, from_notif: bool = False) -> None:
+    """Botón «Tomar»: sin plan SoundSet lleva a Planes; con el plan abre la ventana para tomar la burbuja."""
+    mark_view(uid, req_id, "seen")
+    st.session_state.pop("notif_req", None)
+    if from_notif:  # la notificación vive en un fragmento: hay que recargar toda la página
+        st.session_state.notif_app_rerun = True
+    if not is_artist:
+        st.session_state.page = PAGE_PLANS
+        flash("Para tomar burbujas necesitas el plan SoundSet (modo artista).", ":material/workspace_premium:")
+    else:
+        st.session_state.take_req = req_id
+
+
+def pass_bubble(uid: int, req_id: int) -> None:
+    mark_view(uid, req_id, "dismissed")
+    st.session_state.pop("notif_req", None)
+
+
+def accept_and_notify(uid: int, offer: dict, req: dict) -> None:
+    accept_offer(uid, offer, req)
+    add_message(req["id"], offer["artist_id"], None,
+                f"Oferta aceptada y pagada ({fmt_money(offer['amount'], offer['currency'])}). "
+                "El pago queda retenido hasta la entrega.", actor_id=uid)
+
+
+def reject_and_notify(uid: int, offer: dict, req_id: int) -> None:
+    reject_offer(uid, offer["id"])
+    add_message(req_id, offer["artist_id"], None, "La oferta fue rechazada.", actor_id=uid)
+
+
+def deliver_and_notify(artist_id: int, req_id: int, uploaded) -> None:
+    deliver_request(artist_id, req_id, uploaded)
+    add_message(req_id, artist_id, None, "Sonido entregado. Ya está disponible en «Mis pedidos».", actor_id=artist_id)
+
+
+@st.dialog("Tomar burbuja", on_dismiss=lambda: st.session_state.pop("take_req", None))
+def take_dialog(me: dict, r: dict) -> None:
+    st.markdown(f'<div class="ss-notif">{orb_html(r, small=True)}<div class="tx"><div class="q">{esc(r["text"])}</div>'
+                f'<div class="ss-muted">@{esc(r["username"])}{verified_html(r, 13)}</div></div></div>',
+                unsafe_allow_html=True)
+    if r["kind"] == "budget":
+        amount, currency = float(r["budget"]), r["currency"]
+        st.markdown(f"Esta persona pagará **{fmt_money(amount, currency)}**.")
+    else:
+        c1, c2 = st.columns([2, 1])
+        currency = c2.selectbox("Moneda", CURRENCIES, key="take_cur")
+        clp = currency == "CLP"
+        amount = c1.number_input("¿Cuánto cobras?", min_value=1.0, value=5000.0 if clp else 5.0,
+                                 step=500.0 if clp else 1.0, format="%.0f" if clp else "%.2f", key=f"take_amt_{currency}")
+    msg = st.text_area(f"Mensaje para @{r['username']}", max_chars=400, key="take_msg",
+                       placeholder="¡Hola! Puedo hacerlo con 3 versiones y tenerlo listo en 2 días.")
+    st.caption("Al tomarla se abre un chat con la persona. Ella decide si acepta y paga.")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancelar", key="take_cancel", width="stretch"):
+        st.session_state.pop("take_req", None)
+        st.rerun()
+    if c2.button("Tomar y abrir chat", key="take_go", type="primary", icon=":material/forum:", width="stretch"):
+        create_offer(me["id"], r["id"], float(amount), currency, msg.strip())
+        add_message(r["id"], me["id"], None, f"@{me['username']} tomó la burbuja y ofrece {fmt_money(amount, currency)}.",
+                    actor_id=me["id"])
+        if msg.strip():
+            add_message(r["id"], me["id"], me["id"], msg.strip())
+        mark_view(me["id"], r["id"], "taken")
+        st.session_state.pop("take_req", None)
+        nav_later(page=PAGE_HOME, home_view="Mensajes", chat_thread=(r["id"], me["id"]))
+        flash("Tomaste la burbuja. Ya puedes conversar con la persona.", ":material/forum:")
+        st.rerun()
+
+
+@st.fragment(run_every=15)
+def bubble_notifier(me: dict) -> None:
+    """Cada burbuja nueva cae desde arriba como notificación; si no haces nada, a los 15 s pasa la siguiente."""
+    if st.session_state.pop("notif_app_rerun", False):
+        st.rerun()
+    if st.session_state.get("take_req"):
+        return
+    r = None
+    cur = st.session_state.get("notif_req")
+    if cur and time.time() - st.session_state.get("notif_at", 0) < 14:
+        r = get_request(cur)
+        if r and r["status"] != "open":
+            r = None
+    if r is None:
+        r = next_unseen_request(me["id"])
+        if not r:
+            st.session_state.pop("notif_req", None)
+            return
+        mark_view(me["id"], r["id"], "seen")
+        st.session_state.notif_req = r["id"]
+        st.session_state.notif_at = time.time()
+    artist = plan_of(me)["artist"]
+    with st.container(key=f"bubble_notif_{r['id']}"):
+        st.markdown(f'<div class="ss-notif">{orb_html(r, small=True)}<div class="tx"><div class="tt">Nueva burbuja</div>'
+                    f'<div class="q">{esc(r["text"])}</div><div class="ss-muted">@{esc(r["username"])}'
+                    f'{verified_html(r, 13)} · {price_text(r)}</div></div></div>', unsafe_allow_html=True)
+        a, b = st.columns(2)
+        a.button("Tomar", key=f"ntake_{r['id']}", type="primary", icon=":material/handshake:", width="stretch",
+                 on_click=start_take, args=(artist, r["id"], me["id"], True))
+        b.button("Rechazar", key=f"nrej_{r['id']}", icon=":material/close:", width="stretch",
+                 on_click=pass_bubble, args=(me["id"], r["id"]))
 
 
 def imagination_form(me: dict) -> None:
@@ -2226,78 +2546,30 @@ def imagination_form(me: dict) -> None:
                 st.rerun()
 
 
-def offer_form(me: dict, r: dict, prefix: str) -> None:
-    with st.container(border=True):
-        if r["kind"] == "budget":
-            amount, currency = float(r["budget"]), r["currency"]
-            st.markdown(f"Esta persona pagará **{fmt_money(amount, currency)}**. Si confirmas, ella decide si te lo encarga.")
-        else:
-            c1, c2 = st.columns([2, 1])
-            currency = c2.selectbox("Moneda", CURRENCIES, key=f"{prefix}_cur_{r['id']}")
-            clp = currency == "CLP"
-            amount = c1.number_input("¿Cuánto cobras?", min_value=1.0, value=5000.0 if clp else 5.0,
-                                     step=500.0 if clp else 1.0, format="%.0f" if clp else "%.2f",
-                                     key=f"{prefix}_amt_{r['id']}_{currency}")
-        msg = st.text_input("Mensaje para la persona (opcional)", max_chars=160, key=f"{prefix}_msg_{r['id']}",
-                            placeholder="Ej: lo tengo listo en 2 días, con 3 versiones")
-        b1, b2 = st.columns(2)
-        label = "Confirmar: lo hago" if r["kind"] == "budget" else "Enviar oferta"
-        if b1.button(label, type="primary", key=f"{prefix}_send_{r['id']}", icon=":material/send:", width="stretch"):
-            create_offer(me["id"], r["id"], float(amount), currency, msg.strip())
-            st.session_state.pop("offer_for", None)
-            flash("Oferta enviada. Verás la respuesta en «Mis trabajos».", ":material/send:")
-            st.rerun()
-        if b2.button("Cancelar", key=f"{prefix}_cancel_{r['id']}", width="stretch"):
-            st.session_state.pop("offer_for", None)
-            st.rerun()
-
-
-@st.fragment(run_every=15)
-def bubble_feed(me: dict) -> None:
-    """Una burbuja grande que cambia sola cada 15 segundos."""
-    reqs = [r for r in open_requests(me["id"]) if not r["offered"]]
+def bubble_field(me: dict, per_row: int = 4) -> None:
+    reqs = field_requests(me["id"])
     if not reqs:
-        st.info("No hay burbujas nuevas por ahora. Vuelve en un rato.", icon=":material/bubble_chart:")
+        st.info("Todavía no hay burbujas flotando. Lanza la primera arriba.", icon=":material/bubble_chart:")
         return
-    frozen = st.session_state.get("offer_for")
-    idx = next((i for i, x in enumerate(reqs) if x["id"] == frozen), None)
-    if idx is None:
-        idx = (int(time.time() // 15) + st.session_state.get("bubble_offset", 0)) % len(reqs)
-    r = reqs[idx]
-    st.markdown(bubble_html(r, big=True), unsafe_allow_html=True)
-    st.markdown(f'<p class="ss-muted" style="text-align:center">Burbuja {idx + 1} de {len(reqs)} · '
-                'cambia sola cada 15 segundos</p>', unsafe_allow_html=True)
-    if frozen == r["id"]:
-        offer_form(me, r, "feat")
-        return
-    _, c1, c2, _ = st.columns([1, 1.2, 1, 1])
-    if c1.button("Lo hago" if r["kind"] == "budget" else "Ofrecer ayuda", type="primary",
-                 key=f"feat_take_{r['id']}", icon=":material/handshake:", width="stretch"):
-        st.session_state.offer_for = r["id"]
-        st.rerun(scope="fragment")
-    if c2.button("Pasar", key=f"feat_pass_{r['id']}", icon=":material/skip_next:", width="stretch"):
-        st.session_state.bubble_offset = st.session_state.get("bubble_offset", 0) + 1
-        st.rerun(scope="fragment")
-
-
-def all_bubbles(me: dict) -> None:
-    reqs = open_requests(me["id"])
-    if not reqs:
-        st.info("No hay burbujas abiertas por ahora.")
-        return
-    cols = st.columns(3, gap="medium")
-    for i, r in enumerate(reqs):
-        with cols[i % 3]:
-            st.markdown(bubble_html(r), unsafe_allow_html=True)
-            if st.session_state.get("offer_for") == r["id"]:
-                offer_form(me, r, "all")
-            elif r["offered"]:
-                st.button("Oferta enviada", key=f"all_sent_{r['id']}", disabled=True, width="stretch",
-                          icon=":material/check:")
-            elif st.button("Lo hago" if r["kind"] == "budget" else "Ofrecer ayuda", key=f"all_take_{r['id']}",
-                           icon=":material/handshake:", width="stretch"):
-                st.session_state.offer_for = r["id"]
-                st.rerun()
+    artist = plan_of(me)["artist"]
+    if not artist:
+        st.caption("Puedes ver todas las burbujas. Para tomarlas y cobrar por crearlas necesitas el plan SoundSet.")
+    for start in range(0, len(reqs), per_row):
+        cols = st.columns(per_row, gap="medium")
+        for col, r in zip(cols, reqs[start:start + per_row]):
+            with col:
+                st.markdown(orb_html(r), unsafe_allow_html=True)
+                if r["user_id"] == me["id"]:
+                    st.markdown('<p class="ss-mine">Tu burbuja</p>', unsafe_allow_html=True)
+                elif r["offered"]:
+                    st.button("Abrir chat", key=f"fchat_{r['id']}", icon=":material/forum:", width="stretch",
+                              on_click=open_chat, args=(r["id"], me["id"]))
+                else:
+                    a, b = st.columns(2, gap="small")
+                    a.button("Tomar", key=f"ftake_{r['id']}", type="primary", width="stretch",
+                             on_click=start_take, args=(artist, r["id"], me["id"]))
+                    b.button("Pasar", key=f"fpass_{r['id']}", width="stretch",
+                             on_click=pass_bubble, args=(me["id"], r["id"]))
 
 
 def my_requests_view(me: dict, n_buttons: int) -> None:
@@ -2307,8 +2579,8 @@ def my_requests_view(me: dict, n_buttons: int) -> None:
         return
     for r in reqs:
         with st.container(border=True):
-            c1, c2 = st.columns([1, 1.5], gap="large")
-            c1.markdown(bubble_html(r), unsafe_allow_html=True)
+            c1, c2 = st.columns([1, 2.2], gap="large")
+            c1.markdown(orb_html(r), unsafe_allow_html=True)
             with c2:
                 if r["status"] == "open":
                     offers = request_offers(r["id"])
@@ -2316,19 +2588,21 @@ def my_requests_view(me: dict, n_buttons: int) -> None:
                         st.caption("Esperando que algún artista tome tu burbuja…")
                     for o in offers:
                         st.markdown(
-                            f'<div class="ss-author">{avatar_html(o, 28)}<span><b>{esc(o.get("display_name") or o["username"])}</b> '
-                            f'<span class="ss-muted">@{esc(o["username"])}</span> · '
+                            f'<div class="ss-author">{avatar_html(o, 30)}<span><b>{esc(o.get("display_name") or o["username"])}</b>'
+                            f'{verified_html(o, 14)} <span class="ss-muted">@{esc(o["username"])}</span> · '
                             f'<b style="color:#ff8a2a">{fmt_money(o["amount"], o["currency"])}</b></span></div>',
                             unsafe_allow_html=True)
                         if o["message"]:
                             st.caption(o["message"])
-                        a, b = st.columns(2)
+                        a, b, c = st.columns(3)
                         if a.button("Aceptar y pagar", key=f"acc_{o['id']}", type="primary", width="stretch",
                                     icon=":material/check_circle:"):
                             checkout(f"Encargo a @{o['username']}", o["amount"], o["currency"],
-                                     accept_offer, me["id"], o, r)
-                        if b.button("Rechazar", key=f"rej_{o['id']}", width="stretch", icon=":material/close:"):
-                            reject_offer(me["id"], o["id"])
+                                     accept_and_notify, me["id"], o, r)
+                        b.button("Chat", key=f"ochat_{o['id']}", icon=":material/forum:", width="stretch",
+                                 on_click=open_chat, args=(r["id"], o["artist_id"]))
+                        if c.button("Rechazar", key=f"rej_{o['id']}", width="stretch", icon=":material/close:"):
+                            reject_and_notify(me["id"], o, r["id"])
                             flash("Oferta rechazada.", ":material/close:")
                             st.rerun()
                     if st.button("Quitar mi burbuja", key=f"close_{r['id']}", type="tertiary",
@@ -2340,6 +2614,8 @@ def my_requests_view(me: dict, n_buttons: int) -> None:
                     st.info(f"@{r['artist_username']} está creando tu sonido. Pagaste "
                             f"{fmt_money(r['agreed_amount'], r['agreed_currency'])}; el pago queda retenido hasta "
                             "la entrega.", icon=":material/hourglass_top:")
+                    st.button("Abrir chat", key=f"pchat_{r['id']}", icon=":material/forum:",
+                              on_click=open_chat, args=(r["id"], r["artist_id"]))
                 elif r["status"] == "delivered":
                     st.success(f"@{r['artist_username']} entregó tu sonido.", icon=":material/celebration:")
                     path = BASE_DIR / (r["sound_path"] or "")
@@ -2362,14 +2638,16 @@ def my_requests_view(me: dict, n_buttons: int) -> None:
 def jobs_view(me: dict) -> None:
     jobs = artist_jobs(me["id"])
     if not jobs:
-        st.info("Aún no tomas burbujas. Cuando ofrezcas ayuda, tus trabajos aparecerán aquí.")
+        st.info("Aún no tomas burbujas. Cuando tomes una, tus trabajos aparecerán aquí.")
         return
     for j in jobs:
         with st.container(border=True):
-            c1, c2 = st.columns([1, 1.5], gap="large")
-            c1.markdown(bubble_html(j), unsafe_allow_html=True)
+            c1, c2 = st.columns([1, 2.2], gap="large")
+            c1.markdown(orb_html(j), unsafe_allow_html=True)
             with c2:
                 money = fmt_money(j["amount"], j["currency"])
+                st.button("Abrir chat", key=f"jchat_{j['offer_id']}", icon=":material/forum:",
+                          on_click=open_chat, args=(j["id"], me["id"]))
                 if j["offer_status"] == "pending":
                     st.caption(f"Ofreciste hacerlo por {money}. Esperando respuesta de @{j['username']}.")
                     if st.button("Retirar oferta", key=f"wd_{j['offer_id']}", type="tertiary", icon=":material/undo:"):
@@ -2380,15 +2658,106 @@ def jobs_view(me: dict) -> None:
                 elif j["status"] == "in_progress":
                     st.success(f"¡@{j['username']} aceptó! Pagó {money}; lo recibes al entregar el sonido.",
                                icon=":material/handshake:")
-                    up = st.file_uploader("Sube el sonido terminado (MP3 o WAV)", type=["mp3", "wav"],
-                                          key=f"deliv_{j['id']}")
-                    if st.button("Entregar sonido", key=f"deliv_btn_{j['id']}", type="primary",
-                                 icon=":material/send:", disabled=up is None):
-                        deliver_request(me["id"], j["id"], up)
-                        flash(f"Sonido entregado. Se liberó tu pago de {money}.", ":material/payments:")
-                        st.rerun()
+                    deliver_box(me, j["id"], f"job_{j['id']}")
                 else:
                     st.caption(f"Entregado. Pago liberado: {money}.")
+
+
+def deliver_box(me: dict, req_id: int, key: str) -> None:
+    up = st.file_uploader("Sube el sonido terminado (MP3 o WAV)", type=["mp3", "wav"], key=f"deliv_{key}")
+    if st.button("Entregar sonido", key=f"deliv_btn_{key}", type="primary", icon=":material/send:",
+                 disabled=up is None):
+        deliver_and_notify(me["id"], req_id, up)
+        flash("Sonido entregado. Se liberó tu pago.", ":material/payments:")
+        st.rerun()
+
+
+# ------------------------------------------------------------------ mensajes
+def chat_html(msgs: list[dict], me_id: int) -> str:
+    rows = []
+    for m in msgs:
+        cls = "sys" if m["sender_id"] is None else ("me" if m["sender_id"] == me_id else "")
+        hour = (m.get("created_at") or "")[11:16]
+        rows.append(f'<div class="ss-msg {cls}"><div>{esc(m["text"])}</div>'
+                    f'{"" if cls == "sys" else f"<span>{hour}</span>"}</div>')
+    if not rows:
+        rows = ['<p class="ss-muted">Aún no hay mensajes.</p>']
+    return f'<div class="ss-chat">{"".join(reversed(rows))}</div>'
+
+
+@st.fragment(run_every=4)
+def chat_messages(me_id: int, req_id: int, artist_id: int) -> None:
+    msgs = get_messages(req_id, artist_id)
+    st.markdown(chat_html(msgs, me_id), unsafe_allow_html=True)
+    if msgs:
+        mark_read(me_id, req_id, artist_id, msgs[-1]["id"])
+
+
+def set_thread(thread: tuple) -> None:
+    st.session_state.chat_thread = thread
+
+
+def chat_panel(me: dict, req_id: int, artist_id: int) -> None:
+    r = get_request(req_id)
+    if not r:
+        st.info("Esta burbuja ya no existe.")
+        return
+    owner = r["user_id"] == me["id"]
+    other = get_user(artist_id if owner else r["user_id"]) or {"username": "?"}
+    st.markdown(f'<div class="ss-chat-head">{avatar_html(other, 42)}<div><b>{esc(other.get("display_name") or other["username"])}</b>'
+                f'{verified_html(other, 15)}<div class="ss-muted">{esc(short(r["text"], 80))}</div></div></div>',
+                unsafe_allow_html=True)
+    offer = get_offer(req_id, artist_id)
+    if offer:
+        money = fmt_money(offer["amount"], offer["currency"])
+        if owner and r["status"] == "open" and offer["status"] == "pending":
+            a, b, _ = st.columns([1.8, 1, 0.6])
+            if a.button(f"Aceptar y pagar {money}", key=f"cacc_{offer['id']}", type="primary", width="stretch",
+                        icon=":material/check_circle:"):
+                checkout(f"Encargo a @{other['username']}", offer["amount"], offer["currency"],
+                         accept_and_notify, me["id"], offer, r)
+            if b.button("Rechazar", key=f"crej_{offer['id']}", width="stretch", icon=":material/close:"):
+                reject_and_notify(me["id"], offer, req_id)
+                st.rerun()
+        elif not owner and r["status"] == "in_progress" and r["artist_id"] == me["id"]:
+            with st.expander("Entregar el sonido", icon=":material/upload:", expanded=True):
+                deliver_box(me, req_id, f"chat_{req_id}")
+        elif r["status"] == "delivered" and r["artist_id"] == artist_id:
+            st.caption("Sonido entregado." + (" Lo encuentras en «Mis pedidos»." if owner else f" Pago liberado: {money}."))
+        elif offer["status"] == "pending":
+            st.caption(f"Oferta enviada: {money}. Esperando respuesta.")
+        elif offer["status"] in ("rejected", "withdrawn"):
+            st.caption("Esta oferta ya no está activa.")
+    chat_messages(me["id"], req_id, artist_id)
+    with st.form(f"chat_form_{req_id}_{artist_id}", clear_on_submit=True, border=False):
+        c1, c2 = st.columns([5, 1.2], vertical_alignment="bottom")
+        txt = c1.text_input("Mensaje", placeholder="Escribe un mensaje…", label_visibility="collapsed", max_chars=600)
+        sent = c2.form_submit_button("Enviar", icon=":material/send:", type="primary", width="stretch")
+    if sent and txt.strip():
+        add_message(req_id, artist_id, me["id"], txt.strip())
+        st.rerun()
+
+
+def messages_view(me: dict) -> None:
+    threads = my_threads(me["id"])
+    if not threads:
+        st.info("Aún no tienes conversaciones. Se abren cuando un artista toma una burbuja.", icon=":material/forum:")
+        return
+    keys = [(t["request_id"], t["artist_id"]) for t in threads]
+    sel = tuple(st.session_state.get("chat_thread") or ())
+    if sel not in keys:
+        sel = keys[0]
+    left, right = st.columns([1, 2.3], gap="large")
+    with left:
+        for t, k in zip(threads, keys):
+            other = get_user(t["artist_id"] if t["owner_id"] == me["id"] else t["owner_id"]) or {"username": "?"}
+            label = f"@{other['username']} · {short(t['req_text'], 24)}"
+            if t["unread"] and k != sel:
+                label += f"  ({t['unread']})"
+            st.button(label, key=f"th_{k[0]}_{k[1]}", width="stretch", on_click=set_thread, args=(k,),
+                      type="primary" if k == sel else "secondary")
+    with right:
+        chat_panel(me, *sel)
 
 
 def page_home(me: dict, buttons: list[dict]) -> None:
@@ -2399,30 +2768,20 @@ def page_home(me: dict, buttons: list[dict]) -> None:
     imagination_form(me)
 
     artist = plan_of(me)["artist"]
-    n_offers = pending_offers_count(me["id"])
-    labels = ["Burbujas", f"Mis pedidos ({n_offers})" if n_offers else "Mis pedidos"]
-    if artist:
-        labels.append("Mis trabajos")
-    tabs = st.tabs(labels)
-    with tabs[0]:
-        if artist:
-            if st.toggle("Ver todas las burbujas", key="bubbles_all"):
-                all_bubbles(me)
-            else:
-                bubble_feed(me)
-        else:
-            n = len(open_requests(me["id"]))
-            st.markdown(
-                f'<div class="ss-bubble big" style="--b:#8e24aa"><p>Hay {n} burbuja(s) esperando artistas</p>'
-                '<div class="meta"><span>Con el plan SoundSet activas el modo artista: ves los pedidos y cobras '
-                'por crear sonidos.</span></div></div>', unsafe_allow_html=True)
-            st.button("Activar modo artista", key="home_upgrade", icon=":material/workspace_premium:",
-                      on_click=go_to, args=(PAGE_PLANS,), type="primary")
-    with tabs[1]:
+    views = ["Burbujas", "Mis pedidos", "Mensajes"] + (["Mis trabajos"] if artist else [])
+    counts = {"Mis pedidos": pending_offers_count(me["id"]), "Mensajes": unread_total(me["id"])}
+    if st.session_state.get("home_view") not in views:
+        st.session_state.home_view = "Burbujas"
+    view = st.segmented_control("Sección", views, key="home_view", label_visibility="collapsed",
+                                format_func=lambda v: f"{v} ({counts[v]})" if counts.get(v) else v) or "Burbujas"
+    if view == "Burbujas":
+        bubble_field(me)
+    elif view == "Mis pedidos":
         my_requests_view(me, len(buttons))
-    if artist:
-        with tabs[2]:
-            jobs_view(me)
+    elif view == "Mensajes":
+        messages_view(me)
+    else:
+        jobs_view(me)
 
 
 # ================================================================== PLANES
@@ -2601,9 +2960,19 @@ def main() -> None:
         page_auth()
         return
 
+    for k, v in st.session_state.pop("pending_nav", {}).items():  # cambios de sección pedidos desde una ventana
+        st.session_state[k] = v
     buttons = get_buttons(me["id"])
     page = sidebar(me, len(buttons))
     show_flash()
+    bubble_notifier(me)
+    take_id = st.session_state.get("take_req")
+    if take_id:
+        req = get_request(take_id)
+        if req and req["status"] == "open" and plan_of(me)["artist"] and req["user_id"] != me["id"]:
+            take_dialog(me, req)
+        else:
+            st.session_state.pop("take_req", None)
 
     if page == PAGE_HOME:
         page_home(me, buttons)
