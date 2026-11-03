@@ -110,6 +110,7 @@ PAGE_EDIT = ":material/tune: Editar botones"
 PAGE_PROFILE = ":material/person: Mi perfil"
 PAGE_OBS = ":material/cast: Stream / OBS"
 PAGE_PLANS = ":material/workspace_premium: Planes"
+PAGE_ADMIN = ":material/admin_panel_settings: Admin"
 # Inicio (Imaginación) primero; Comunidad justo debajo de Mi SoundPad para llegar más rápido
 PAGES = [PAGE_HOME, PAGE_PAD, PAGE_COMMUNITY, PAGE_ADD, PAGE_EDIT, PAGE_OBS, PAGE_PLANS, PAGE_PROFILE]
 
@@ -521,6 +522,8 @@ def init_db() -> bool:
                           ("chat_prefix", "TEXT DEFAULT '!sonido'"), ("obs_cooldown", "INTEGER DEFAULT 5")]:
             _ensure_column(con, "users", col, decl)
         _ensure_column(con, "community", "price_usd", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(con, "users", "is_admin", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "users", "banned", "INTEGER NOT NULL DEFAULT 0")
         # migración desde la versión con emojis
         if _ensure_column(con, "buttons", "icon", "TEXT DEFAULT 'speaker'"):
             cols = {r[1] for r in con.execute("PRAGMA table_info(buttons)")}
@@ -563,8 +566,93 @@ def verify_user(login: str, password: str) -> dict | None:
         row = con.execute("SELECT * FROM users WHERE username = ? OR lower(email) = lower(?)",
                           (login, login)).fetchone()
     if row and hmac.compare_digest(row["pw_hash"], _hash(password, row["salt"])):
-        return {"id": row["id"], "username": row["username"]}
+        return {"id": row["id"], "username": row["username"], "banned": bool(row["banned"])}
     return None
+
+
+# ------------------------------------------------------------------ administrador
+def admin_credentials() -> tuple[str, str] | None:
+    """Lee [admin] de .streamlit/secrets.toml (o de los Secrets de Streamlit Cloud)."""
+    try:
+        cfg = st.secrets["admin"]
+        user, pw = str(cfg.get("username", "admin")).strip(), str(cfg["password"])
+    except Exception:
+        return None
+    return (user, pw) if user and pw else None
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_admin() -> str | None:
+    """Crea o actualiza la cuenta admin con la contraseña de los secrets en cada arranque."""
+    creds = admin_credentials()
+    if not creds:
+        return None
+    user, pw = creds
+    salt = secrets.token_hex(16)
+    with db() as con:
+        row = con.execute("SELECT id FROM users WHERE username = ?", (user,)).fetchone()
+        if row:
+            con.execute("UPDATE users SET pw_hash = ?, salt = ?, is_admin = 1, banned = 0, plan = 'soundset', "
+                        "plan_expires = '9999-12-31' WHERE id = ?", (_hash(pw, salt), salt, row["id"]))
+            return user
+        cur = con.execute(
+            "INSERT INTO users(username, pw_hash, salt, display_name, bio, plan, plan_expires, is_admin) "
+            "VALUES (?, ?, ?, 'Administrador', 'Cuenta oficial de SoundSet.', 'soundset', '9999-12-31', 1)",
+            (user, _hash(pw, salt), salt))
+        uid = cur.lastrowid
+    seed_default_buttons(uid)
+    return user
+
+
+def is_admin(u: dict) -> bool:
+    return bool(u.get("is_admin"))
+
+
+def admin_set_plan(uid: int, plan: str, days: int | None) -> None:
+    expires = None if plan == "free" else ("9999-12-31" if days is None else
+                                           (date.today() + timedelta(days=days)).isoformat())
+    with db() as con:
+        con.execute("UPDATE users SET plan = ?, plan_expires = ? WHERE id = ? AND is_admin = 0", (plan, expires, uid))
+
+
+def admin_set_banned(uid: int, banned: bool) -> None:
+    with db() as con:
+        con.execute("UPDATE users SET banned = ? WHERE id = ? AND is_admin = 0", (int(banned), uid))
+
+
+def admin_delete_user(uid: int) -> None:
+    with db() as con:
+        u = con.execute("SELECT username, is_admin FROM users WHERE id = ?", (uid,)).fetchone()
+        if not u or u["is_admin"]:
+            return
+        files = [r[0] for r in con.execute("SELECT sound_path FROM community WHERE author_id = ?", (uid,))]
+        files += [r[0] for r in con.execute("SELECT sound_path FROM requests WHERE user_id = ? AND sound_path IS NOT NULL", (uid,))]
+        con.execute("DELETE FROM message_reads WHERE user_id = ?", (uid,))
+        con.execute("DELETE FROM users WHERE id = ?", (uid,))  # el resto se borra en cascada
+    for f in files:
+        (BASE_DIR / f).unlink(missing_ok=True)
+    shutil.rmtree(USER_SOUNDS_DIR / u["username"].lower(), ignore_errors=True)
+
+
+def admin_delete_community(item_id: int) -> None:
+    with db() as con:
+        row = con.execute("SELECT sound_path FROM community WHERE id = ?", (item_id,)).fetchone()
+        con.execute("DELETE FROM community WHERE id = ?", (item_id,))
+    if row:
+        (BASE_DIR / row["sound_path"]).unlink(missing_ok=True)
+
+
+def admin_delete_request(req_id: int) -> None:
+    with db() as con:
+        row = con.execute("SELECT sound_path FROM requests WHERE id = ?", (req_id,)).fetchone()
+        con.execute("DELETE FROM requests WHERE id = ?", (req_id,))
+    if row and row["sound_path"]:
+        (BASE_DIR / row["sound_path"]).unlink(missing_ok=True)
+
+
+def admin_query(sql: str, params: tuple = ()) -> list[dict]:
+    with db() as con:
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
 
 
 def get_user(uid: int) -> dict | None:
@@ -1851,7 +1939,9 @@ def page_auth() -> None:
                 ok = st.form_submit_button("Entrar", type="primary", width="stretch")
             if ok:
                 user = verify_user(u.strip(), p)
-                if user:
+                if user and user["banned"]:
+                    st.error("Esta cuenta está suspendida. Escribe al equipo de SoundSet si crees que es un error.")
+                elif user:
                     st.session_state.user = user
                     st.rerun()
                 else:
@@ -1866,7 +1956,9 @@ def page_auth() -> None:
                 ok = st.form_submit_button("Crear cuenta", type="primary", width="stretch")
             if ok:
                 u, email = u.strip(), email.strip()
-                if not USERNAME_RE.match(u):
+                if (ensure_admin() or "").lower() == u.lower():
+                    st.error("Ese usuario ya existe. Elige otro nombre.")
+                elif not USERNAME_RE.match(u):
                     st.error("El usuario debe tener de 3 a 20 caracteres (letras, números, _ o -).")
                 elif email and not EMAIL_RE.match(email):
                     st.error("Ese correo no parece válido. Revisa que tenga @ y un dominio.")
@@ -1909,7 +2001,13 @@ def sidebar(me: dict, n_buttons: int) -> str:
         if unread:
             st.caption(f"Tienes {unread} mensaje(s) sin leer.")
         st.divider()
-        page = st.radio("Menú", PAGES, key="page", label_visibility="collapsed")
+        if is_admin(me):
+            st.markdown('<span class="ss-badge" style="border-color:#ff6a00;color:#ffa04d">Administrador</span>',
+                        unsafe_allow_html=True)
+        options = PAGES + [PAGE_ADMIN] if is_admin(me) else PAGES
+        if st.session_state.get("page") not in options:
+            st.session_state.page = PAGE_HOME
+        page = st.radio("Menú", options, key="page", label_visibility="collapsed")
         st.divider()
         if st.button("Detener todos los sonidos", key="stop_all", icon=":material/stop_circle:", width="stretch"):
             st.session_state.stop_nonce += 1
@@ -2939,6 +3037,162 @@ def render_overlay(token: str, test: bool) -> None:
     show_html(build_overlay_html(payload, cfg), 260)
 
 
+
+# ================================================================== ADMIN
+def page_admin(me: dict) -> None:
+    st.markdown("## Panel de administración")
+    view = st.segmented_control("Sección", ["Resumen", "Usuarios", "Comunidad", "Imaginación", "Pagos"],
+                                default="Resumen", key="admin_view", label_visibility="collapsed") or "Resumen"
+    if view == "Resumen":
+        admin_summary()
+    elif view == "Usuarios":
+        admin_users(me)
+    elif view == "Comunidad":
+        admin_community()
+    elif view == "Imaginación":
+        admin_requests()
+    else:
+        admin_payments()
+
+
+def admin_summary() -> None:
+    users = admin_query("SELECT plan, plan_expires, banned FROM users WHERE is_admin = 0")
+    by_plan = {k: 0 for k in PLANS}
+    for u in users:
+        by_plan[active_plan(u)] += 1
+    one = lambda sql: admin_query(sql)[0]["n"]
+    c = st.columns(4)
+    c[0].metric("Usuarios", len(users))
+    c[1].metric("Con plan pagado", by_plan["premium"] + by_plan["soundset"])
+    c[2].metric("Botones creados", one("SELECT COUNT(*) AS n FROM buttons"))
+    c[3].metric("Suspendidos", sum(1 for u in users if u["banned"]))
+    c = st.columns(4)
+    c[0].metric("Estándar", by_plan["free"])
+    c[1].metric("Premium", by_plan["premium"])
+    c[2].metric("SoundSet", by_plan["soundset"])
+    c[3].metric("En Comunidad", one("SELECT COUNT(*) AS n FROM community"))
+    c = st.columns(4)
+    c[0].metric("Burbujas abiertas", one("SELECT COUNT(*) AS n FROM requests WHERE status = 'open'"))
+    c[1].metric("Encargos en curso", one("SELECT COUNT(*) AS n FROM requests WHERE status = 'in_progress'"))
+    c[2].metric("Encargos entregados", one("SELECT COUNT(*) AS n FROM requests WHERE status = 'delivered'"))
+    c[3].metric("Mensajes", one("SELECT COUNT(*) AS n FROM messages"))
+    totals = admin_query("SELECT kind, currency, SUM(amount) AS total, COUNT(*) AS n FROM payments GROUP BY kind, currency")
+    if totals:
+        st.markdown("#### Ingresos registrados")
+        names = {"plan": "Planes", "sound": "Ventas de sonidos", "request": "Encargos de Imaginación"}
+        st.dataframe([{"Tipo": names.get(t["kind"], t["kind"]), "Pagos": t["n"],
+                       "Total": fmt_money(t["total"], t["currency"])} for t in totals], hide_index=True, width="stretch")
+        if PAYMENT_MODE == "demo":
+            st.caption("Modo demo: estos montos son de prueba.")
+
+
+def admin_users(me: dict) -> None:
+    q = st.text_input("Buscar usuario", placeholder="Usuario, nombre o correo", key="adm_q",
+                      icon=":material/search:", label_visibility="collapsed")
+    like = f"%{q.strip()}%"
+    users = admin_query(
+        "SELECT u.*, (SELECT COUNT(*) FROM buttons b WHERE b.user_id = u.id) AS n_buttons FROM users u "
+        "WHERE u.username LIKE ? OR u.display_name LIKE ? OR IFNULL(u.email, '') LIKE ? ORDER BY u.id DESC",
+        (like, like, like))
+    st.dataframe([{"Usuario": f"@{u['username']}", "Nombre": u["display_name"], "Correo": u["email"] or "",
+                   "Plan": PLANS[active_plan(u)]["name"],
+                   "Vence": "" if active_plan(u) == "free" else ("Nunca" if u["plan_expires"] == "9999-12-31"
+                                                               else u["plan_expires"]),
+                   "Botones": u["n_buttons"], "Estado": "Suspendido" if u["banned"] else "Activo",
+                   "Admin": "Sí" if u["is_admin"] else "", "Registro": (u["created_at"] or "")[:10]} for u in users],
+                 hide_index=True, width="stretch")
+    editable = [u for u in users if not u["is_admin"]]
+    if not editable:
+        return
+    st.markdown("#### Gestionar usuario")
+    labels = {u["id"]: f"@{u['username']} · {u['display_name'] or ''}" for u in editable}
+    uid = st.selectbox("Usuario", list(labels), format_func=labels.get, key="adm_user")
+    u = next(x for x in editable if x["id"] == uid)
+    with st.container(border=True):
+        a, b, c = st.columns([1.2, 1.2, 1], vertical_alignment="bottom")
+        plan = a.selectbox("Plan", list(PLANS), index=list(PLANS).index(active_plan(u)),
+                           format_func=lambda k: PLANS[k]["name"], key=f"adm_plan_{uid}")
+        length = b.selectbox("Duración", ["1 mes", "1 año", "Sin vencimiento"], index=1, key=f"adm_len_{uid}",
+                             disabled=plan == "free")
+        if c.button("Aplicar plan", key=f"adm_apply_{uid}", type="primary", icon=":material/workspace_premium:",
+                    width="stretch"):
+            admin_set_plan(uid, plan, {"1 mes": 30, "1 año": 365}.get(length))
+            flash(f"Plan de @{u['username']} actualizado a {PLANS[plan]['name']}.")
+            st.rerun()
+        a, b, c = st.columns([1.2, 1.2, 1], vertical_alignment="bottom")
+        if u["banned"]:
+            if a.button("Reactivar cuenta", key=f"adm_unban_{uid}", icon=":material/lock_open:", width="stretch"):
+                admin_set_banned(uid, False)
+                flash(f"@{u['username']} fue reactivado.")
+                st.rerun()
+        elif a.button("Suspender cuenta", key=f"adm_ban_{uid}", icon=":material/block:", width="stretch"):
+            admin_set_banned(uid, True)
+            flash(f"@{u['username']} fue suspendido.", ":material/block:")
+            st.rerun()
+        confirm = b.checkbox("Confirmo eliminar todo", key=f"adm_conf_{uid}")
+        if c.button("Eliminar cuenta", key=f"del_user_{uid}", icon=":material/delete:", width="stretch",
+                    disabled=not confirm):
+            admin_delete_user(uid)
+            st.session_state.pop("adm_user", None)
+            flash(f"Cuenta @{u['username']} eliminada con sus botones, publicaciones y burbujas.", ":material/delete:")
+            st.rerun()
+
+
+def admin_community() -> None:
+    items = admin_query("SELECT c.*, u.username FROM community c JOIN users u ON u.id = c.author_id ORDER BY c.id DESC")
+    if not items:
+        st.info("No hay publicaciones en la comunidad.")
+        return
+    st.dataframe([{"Botón": i["name"], "Autor": f"@{i['username']}", "Descripción": i["description"],
+                   "Precio": fmt_money(i["price_usd"], "USD") if i["price_usd"] else "Gratis",
+                   "Descargas": i["downloads"], "Fecha": (i["created_at"] or "")[:10]} for i in items],
+                 hide_index=True, width="stretch")
+    labels = {i["id"]: f"{i['name']} · @{i['username']}" for i in items}
+    iid = st.selectbox("Publicación", list(labels), format_func=labels.get, key="adm_item")
+    item = next(i for i in items if i["id"] == iid)
+    show_html(build_pad_html([button_payload({**item, "id": f"a{iid}"})], "mini", st.session_state.stop_nonce), 112)
+    if st.button("Eliminar de la comunidad", key=f"del_com_{iid}", icon=":material/delete:"):
+        admin_delete_community(iid)
+        st.session_state.pop("adm_item", None)
+        flash("Publicación eliminada.", ":material/delete:")
+        st.rerun()
+
+
+def admin_requests() -> None:
+    reqs = admin_query("SELECT r.*, u.username, a.username AS artist FROM requests r JOIN users u ON u.id = r.user_id "
+                       "LEFT JOIN users a ON a.id = r.artist_id ORDER BY r.id DESC")
+    if not reqs:
+        st.info("No hay burbujas todavía.")
+        return
+    status = {"open": "Abierta", "in_progress": "En curso", "delivered": "Entregada", "closed": "Retirada"}
+    st.dataframe([{"Pedido": r["text"], "De": f"@{r['username']}", "Estado": status.get(r["status"], r["status"]),
+                   "Artista": f"@{r['artist']}" if r["artist"] else "",
+                   "Precio": price_text(r) if r["status"] == "open" else
+                   (fmt_money(r["agreed_amount"], r["agreed_currency"]) if r["agreed_amount"] else ""),
+                   "Fecha": (r["created_at"] or "")[:10]} for r in reqs], hide_index=True, width="stretch")
+    labels = {r["id"]: f"{short(r['text'], 60)} · @{r['username']}" for r in reqs}
+    rid = st.selectbox("Burbuja", list(labels), format_func=labels.get, key="adm_req")
+    st.caption("Eliminar una burbuja también borra sus ofertas y su chat.")
+    if st.button("Eliminar burbuja", key=f"del_req_{rid}", icon=":material/delete:"):
+        admin_delete_request(rid)
+        st.session_state.pop("adm_req", None)
+        flash("Burbuja eliminada.", ":material/delete:")
+        st.rerun()
+
+
+def admin_payments() -> None:
+    pays = admin_query("SELECT p.*, u.username, v.username AS payee FROM payments p JOIN users u ON u.id = p.user_id "
+                       "LEFT JOIN users v ON v.id = p.payee_id ORDER BY p.id DESC")
+    if not pays:
+        st.info("Todavía no hay pagos.")
+        return
+    status = {"paid": "Pagado", "held": "Retenido", "released": "Liberado"}
+    st.dataframe([{"Fecha": (p["created_at"] or "")[:16], "Pagó": f"@{p['username']}",
+                   "Recibe": f"@{p['payee']}" if p["payee"] else "SoundSet", "Detalle": p["description"],
+                   "Monto": fmt_money(p["amount"], p["currency"]), "Estado": status.get(p["status"], p["status"])}
+                  for p in pays], hide_index=True, width="stretch")
+
+
 # ================================================================== MAIN
 def main() -> None:
     ensure_default_sounds()
@@ -2952,8 +3206,12 @@ def main() -> None:
     if "edit_mode" in st.session_state:  # mantiene el modo edición al ir y volver de otra sección
         st.session_state.edit_mode = st.session_state.edit_mode
 
+    ensure_admin()
     session_user = st.session_state.get("user")
     me = get_user(session_user["id"]) if session_user else None
+    if me and me.get("banned"):  # si el admin la suspende, se cierra la sesión
+        me = None
+        flash("Tu cuenta fue suspendida.", ":material/block:")
     if not me:
         st.session_state.pop("user", None)
         show_flash()
@@ -2988,6 +3246,8 @@ def main() -> None:
         page_obs(me, buttons)
     elif page == PAGE_PLANS:
         page_plans(me)
+    elif page == PAGE_ADMIN and is_admin(me):
+        page_admin(me)
     else:
         page_pad(me, buttons)
 
