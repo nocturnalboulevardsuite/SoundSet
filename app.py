@@ -12,6 +12,7 @@ Estructura:
         default/     -> 10 sonidos de ejemplo (se generan solos si no existen)
         users/       -> sonidos que sube cada usuario (una carpeta por usuario)
         community/   -> copias de los botones publicados en la comunidad
+        requests/    -> sonidos entregados por artistas en Imaginación
     soundset.db      -> base de datos SQLite (se crea sola)
 """
 from __future__ import annotations
@@ -23,15 +24,18 @@ import html
 import io
 import json
 import math
+import random
 import re
 import secrets
 import shutil
 import sqlite3
 import tempfile
+import time
 import unicodedata
 import uuid
 import wave
 from contextlib import contextmanager
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +48,11 @@ except Exception:  # mutagen es opcional (solo sirve para leer la duración de l
     MutagenFile = None
 
 try:
+    import miniaudio  # decodifica MP3/WAV sin ffmpeg para ajustar la calidad según el plan
+except Exception:
+    miniaudio = None
+
+try:
     from PIL import Image, ImageOps
 except Exception:  # Pillow viene con Streamlit, pero por si acaso
     Image = ImageOps = None
@@ -54,11 +63,29 @@ SOUNDS_DIR = BASE_DIR / "sounds"
 DEFAULT_DIR = SOUNDS_DIR / "default"
 USER_SOUNDS_DIR = SOUNDS_DIR / "users"
 COMMUNITY_DIR = SOUNDS_DIR / "community"
+REQUESTS_DIR = SOUNDS_DIR / "requests"
 DB_PATH = BASE_DIR / "soundset.db"
 SR = 22050  # frecuencia de muestreo de los sonidos de ejemplo
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,20}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PER_PAGE = 12
+
+# Pagos: "demo" registra los pagos sin cobrar dinero real.
+# Para cobrar de verdad, conecta Mercado Pago, Flow o Stripe dentro de process_payment().
+PAYMENT_MODE = "demo"
+
+PLANS = {
+    "free": {"name": "Estándar", "price": 0, "limit": 20, "sample_rate": 22050, "channels": 1,
+             "kbps": 352.8, "quality": "Calidad intermedia (hasta 352 kbps · 22 kHz mono)",
+             "obs": False, "sell": False, "artist": False},
+    "premium": {"name": "Premium", "price": 4, "limit": 100, "sample_rate": 44100, "channels": 2,
+                "kbps": 1411.2, "quality": "Calidad CD (hasta 1411 kbps · 44,1 kHz estéreo)",
+                "obs": True, "sell": True, "artist": False},
+    "soundset": {"name": "SoundSet", "price": 10, "limit": None, "sample_rate": 44100, "channels": 2,
+                 "kbps": 1411.2, "quality": "Calidad CD (hasta 1411 kbps · 44,1 kHz estéreo)",
+                 "obs": True, "sell": True, "artist": True},
+}
+CURRENCIES = ["CLP", "USD"]
 
 COLORS = {
     "Rojo": "#e53935",
@@ -75,13 +102,16 @@ COLORS = {
     "Negro": "#1c1a19",
 }
 
+PAGE_HOME = ":material/bubble_chart: Inicio"
 PAGE_PAD = ":material/grid_view: Mi SoundPad"
 PAGE_COMMUNITY = ":material/groups: Comunidad"
 PAGE_ADD = ":material/add_circle: Agregar botón"
 PAGE_EDIT = ":material/tune: Editar botones"
 PAGE_PROFILE = ":material/person: Mi perfil"
-# Comunidad va justo debajo de Mi SoundPad para llegar más rápido
-PAGES = [PAGE_PAD, PAGE_COMMUNITY, PAGE_ADD, PAGE_EDIT, PAGE_PROFILE]
+PAGE_OBS = ":material/cast: Stream / OBS"
+PAGE_PLANS = ":material/workspace_premium: Planes"
+# Inicio (Imaginación) primero; Comunidad justo debajo de Mi SoundPad para llegar más rápido
+PAGES = [PAGE_HOME, PAGE_PAD, PAGE_COMMUNITY, PAGE_ADD, PAGE_EDIT, PAGE_OBS, PAGE_PLANS, PAGE_PROFILE]
 
 st.set_page_config(
     page_title="SoundSet",
@@ -340,7 +370,7 @@ def _write_wav(path: Path, data: np.ndarray) -> None:
 
 @st.cache_resource(show_spinner=False)
 def ensure_default_sounds() -> bool:
-    for folder in (DEFAULT_DIR, USER_SOUNDS_DIR, COMMUNITY_DIR):
+    for folder in (DEFAULT_DIR, USER_SOUNDS_DIR, COMMUNITY_DIR, REQUESTS_DIR):
         folder.mkdir(parents=True, exist_ok=True)
     for key, *_, gen in DEFAULT_SOUNDS:
         path = DEFAULT_DIR / f"{key}.wav"
@@ -412,6 +442,48 @@ def init_db() -> bool:
                 downloads INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS purchases(
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                item_id INTEGER NOT NULL REFERENCES community(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, item_id)
+            );
+            CREATE TABLE IF NOT EXISTS payments(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                payee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                kind TEXT NOT NULL,
+                ref_id INTEGER,
+                description TEXT,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                budget REAL,
+                currency TEXT,
+                color TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                artist_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                agreed_amount REAL,
+                agreed_currency TEXT,
+                sound_path TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS offers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                artist_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                message TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS community_saves(
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 item_id INTEGER NOT NULL REFERENCES community(id) ON DELETE CASCADE,
@@ -421,8 +493,13 @@ def init_db() -> bool:
         )
         # columnas de perfil (sirve también para bases de datos de la versión anterior)
         for col, decl in [("display_name", "TEXT"), ("email", "TEXT"), ("bio", "TEXT DEFAULT ''"),
-                          ("avatar_b64", "TEXT"), ("avatar_mime", "TEXT")]:
+                          ("avatar_b64", "TEXT"), ("avatar_mime", "TEXT"),
+                          ("plan", "TEXT DEFAULT 'free'"), ("plan_expires", "TEXT"),
+                          ("obs_token", "TEXT"), ("twitch_channel", "TEXT"), ("twitch_client_id", "TEXT"),
+                          ("twitch_token", "TEXT"), ("chat_enabled", "INTEGER DEFAULT 0"),
+                          ("chat_prefix", "TEXT DEFAULT '!sonido'"), ("obs_cooldown", "INTEGER DEFAULT 5")]:
             _ensure_column(con, "users", col, decl)
+        _ensure_column(con, "community", "price_usd", "REAL NOT NULL DEFAULT 0")
         # migración desde la versión con emojis
         if _ensure_column(con, "buttons", "icon", "TEXT DEFAULT 'speaker'"):
             cols = {r[1] for r in con.execute("PRAGMA table_info(buttons)")}
@@ -449,7 +526,7 @@ def create_user(username: str, password: str, email: str | None) -> int | None:
     try:
         with db() as con:
             cur = con.execute(
-                "INSERT INTO users(username, pw_hash, salt, display_name, email, bio) VALUES (?, ?, ?, ?, ?, '')",
+                "INSERT INTO users(username, pw_hash, salt, display_name, email, bio, plan) VALUES (?, ?, ?, ?, ?, '', 'free')",
                 (username, _hash(password, salt), salt, username, email or None),
             )
             uid = cur.lastrowid
@@ -502,6 +579,124 @@ def user_stats(uid: int) -> dict:
             "SELECT COUNT(*) FROM community_saves s JOIN community c ON c.id = s.item_id WHERE c.author_id = ?",
             (uid,)).fetchone()[0]
     return {"buttons": buttons, "published": published, "saves": saves}
+
+
+# ------------------------------------------------------------------ planes y pagos
+def active_plan(u: dict) -> str:
+    """Plan vigente. Si un plan pagado venció, la cuenta vuelve a Estándar (sin borrar sus sonidos)."""
+    plan = u.get("plan") or "free"
+    if plan != "free" and (not u.get("plan_expires") or u["plan_expires"] < date.today().isoformat()):
+        return "free"
+    return plan if plan in PLANS else "free"
+
+
+def plan_of(u: dict) -> dict:
+    return PLANS[active_plan(u)]
+
+
+def room_left(u: dict, n_buttons: int) -> float:
+    limit = plan_of(u)["limit"]
+    return math.inf if limit is None else max(0, limit - n_buttons)
+
+
+def fmt_money(amount: float, currency: str) -> str:
+    if currency == "CLP":
+        return f"${int(round(amount)):,} CLP".replace(",", ".")
+    return f"US${amount:,.2f}"
+
+
+def record_payment(con, user_id, payee_id, kind, ref_id, description, amount, currency, status) -> None:
+    con.execute(
+        "INSERT INTO payments(user_id, payee_id, kind, ref_id, description, amount, currency, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, payee_id, kind, ref_id, description, amount, currency, status),
+    )
+
+
+def process_payment(amount: float, currency: str, description: str) -> bool:
+    """Aquí va la pasarela real (Mercado Pago, Flow, Stripe…). En modo demo siempre se aprueba."""
+    if PAYMENT_MODE == "demo":
+        return True
+    raise NotImplementedError("Conecta tu pasarela de pago en process_payment().")
+
+
+def buy_plan(uid: int, plan: str) -> None:
+    u = get_user(uid)
+    today = date.today()
+    base = today
+    if active_plan(u) == plan and u.get("plan_expires"):
+        base = max(today, date.fromisoformat(u["plan_expires"]))  # renovar suma un año más
+    expires = (base + timedelta(days=365)).isoformat()
+    with db() as con:
+        con.execute("UPDATE users SET plan = ?, plan_expires = ? WHERE id = ?", (plan, expires, uid))
+        record_payment(con, uid, None, "plan", None, f"Plan {PLANS[plan]['name']} (1 año)",
+                       PLANS[plan]["price"], "USD", "paid")
+
+
+def cancel_plan(uid: int) -> None:
+    with db() as con:
+        con.execute("UPDATE users SET plan = 'free', plan_expires = NULL WHERE id = ?", (uid,))
+
+
+def my_payments(uid: int) -> list[dict]:
+    with db() as con:
+        rows = con.execute("SELECT * FROM payments WHERE user_id = ? OR payee_id = ? ORDER BY id DESC",
+                           (uid, uid)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def earnings(uid: int) -> dict:
+    out = {"available": {}, "held": {}}
+    with db() as con:
+        for r in con.execute("SELECT amount, currency, status FROM payments WHERE payee_id = ?", (uid,)):
+            bucket = "held" if r["status"] == "held" else "available"
+            out[bucket][r["currency"]] = out[bucket].get(r["currency"], 0) + r["amount"]
+    return out
+
+
+# ------------------------------------------------------------------ calidad de audio
+def audio_kbps(data: bytes, ext: str) -> float | None:
+    if ext == ".wav":
+        try:
+            with wave.open(io.BytesIO(data), "rb") as w:
+                return w.getframerate() * w.getnchannels() * w.getsampwidth() * 8 / 1000
+        except Exception:
+            return None
+    if MutagenFile is not None:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(data)
+            p = Path(tmp.name)
+        try:
+            m = MutagenFile(str(p))
+            if m is not None and getattr(m.info, "bitrate", None):
+                return m.info.bitrate / 1000
+        except Exception:
+            return None
+        finally:
+            p.unlink(missing_ok=True)
+    return None
+
+
+def conform_quality(data: bytes, ext: str, plan: dict) -> tuple[bytes, str, str | None]:
+    """Si el audio supera la calidad máxima del plan, lo convierte a WAV al máximo permitido."""
+    kbps = audio_kbps(data, ext)
+    if kbps is not None and kbps <= plan["kbps"] + 0.5:
+        return data, ext, None
+    if miniaudio is None:
+        return data, ext, None
+    try:
+        dec = miniaudio.decode(data, output_format=miniaudio.SampleFormat.SIGNED16,
+                               nchannels=plan["channels"], sample_rate=plan["sample_rate"])
+    except Exception:
+        return data, ext, None
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(dec.nchannels)
+        w.setsampwidth(2)
+        w.setframerate(dec.sample_rate)
+        w.writeframes(dec.samples.tobytes())
+    before = f"{kbps:.0f} kbps" if kbps else "más de lo permitido"
+    return buf.getvalue(), ".wav", f"El audio venía a {before}; se ajustó a {int(plan['kbps'])} kbps según tu plan."
 
 
 # ------------------------------------------------------------------ botones
@@ -587,15 +782,22 @@ def _copy_sound(src_rel: str, dest_dir: Path, rel_prefix: str) -> str:
     return f"{rel_prefix}/{name}"
 
 
-def publish_button(uid: int, button: dict, description: str) -> None:
+def publish_button(uid: int, button: dict, description: str, price_usd: float = 0.0) -> None:
     path = _copy_sound(button["sound_path"], COMMUNITY_DIR, "sounds/community")
     with db() as con:
         con.execute(
             "INSERT INTO community(author_id, name, description, icon, image_b64, image_mime, color, sound_path,"
-            " start_s, end_s, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " start_s, end_s, volume, price_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (uid, button["name"], description, button["icon"], button["image_b64"], button["image_mime"],
-             button["color"], path, button["start_s"], button["end_s"], button["volume"]),
+             button["color"], path, button["start_s"], button["end_s"], button["volume"], price_usd),
         )
+
+
+def buy_download(uid: int, item: dict) -> None:
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO purchases(user_id, item_id) VALUES (?, ?)", (uid, item["id"]))
+        record_payment(con, uid, item["author_id"], "sound", item["id"], f"Descarga «{item['name']}»",
+                       item["price_usd"], "USD", "paid")
 
 
 def list_community(uid: int, query: str, order: str, only_mine: bool) -> list[dict]:
@@ -608,11 +810,12 @@ def list_community(uid: int, query: str, order: str, only_mine: bool) -> list[di
     sql = (
         "SELECT c.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.bio, "
         " (SELECT COUNT(*) FROM community_saves s WHERE s.item_id = c.id) AS saves, "
-        " EXISTS(SELECT 1 FROM community_saves s WHERE s.item_id = c.id AND s.user_id = ?) AS saved_by_me "
+        " EXISTS(SELECT 1 FROM community_saves s WHERE s.item_id = c.id AND s.user_id = ?) AS saved_by_me, "
+        " EXISTS(SELECT 1 FROM purchases p WHERE p.item_id = c.id AND p.user_id = ?) AS bought_by_me "
         "FROM community c JOIN users u ON u.id = c.author_id "
         "WHERE (c.name LIKE ? OR c.description LIKE ? OR u.username LIKE ? OR u.display_name LIKE ?)"
     )
-    params: list = [uid, like, like, like, like]
+    params: list = [uid, uid, like, like, like, like]
     if only_mine:
         sql += " AND c.author_id = ?"
         params.append(uid)
@@ -644,6 +847,150 @@ def unpublish(uid: int, item_id: int) -> None:
         (BASE_DIR / row["sound_path"]).unlink(missing_ok=True)
 
 
+# ------------------------------------------------------------------ Imaginación (pedidos a artistas)
+def create_request(uid: int, text: str, kind: str, budget: float | None, currency: str | None, color: str) -> None:
+    with db() as con:
+        con.execute("INSERT INTO requests(user_id, text, kind, budget, currency, color) VALUES (?, ?, ?, ?, ?, ?)",
+                    (uid, text, kind, budget, currency, color))
+
+
+_REQ_SELECT = ("SELECT r.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime "
+               "FROM requests r JOIN users u ON u.id = r.user_id ")
+
+
+def open_requests(exclude_uid: int) -> list[dict]:
+    """Burbujas abiertas de otras personas, marcando si el artista ya envió una oferta."""
+    with db() as con:
+        rows = con.execute(
+            _REQ_SELECT.replace("FROM", ", EXISTS(SELECT 1 FROM offers o WHERE o.request_id = r.id "
+                                        "AND o.artist_id = ? AND o.status = 'pending') AS offered FROM")
+            + "WHERE r.status = 'open' AND r.user_id != ? ORDER BY r.id DESC",
+            (exclude_uid, exclude_uid)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_open_requests() -> int:
+    with db() as con:
+        return con.execute("SELECT COUNT(*) FROM requests WHERE status = 'open'").fetchone()[0]
+
+
+def my_requests(uid: int) -> list[dict]:
+    with db() as con:
+        rows = con.execute(
+            "SELECT r.*, u.username, u.display_name, a.username AS artist_username FROM requests r "
+            "JOIN users u ON u.id = r.user_id LEFT JOIN users a ON a.id = r.artist_id "
+            "WHERE r.user_id = ? AND r.status != 'closed' ORDER BY r.id DESC", (uid,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_request_sound(uid: int, username: str, req: dict) -> None:
+    path = _copy_sound(req["sound_path"], USER_SOUNDS_DIR / username.lower(), f"sounds/users/{username.lower()}")
+    name = req["text"].strip()
+    name = name if len(name) <= 24 else name[:23].rstrip() + "…"
+    add_button(uid, name=name, icon="wave", color=req["color"], sound_path=path)
+
+
+def request_offers(req_id: int) -> list[dict]:
+    with db() as con:
+        rows = con.execute(
+            "SELECT o.*, u.username, u.display_name, u.avatar_b64, u.avatar_mime, u.bio FROM offers o "
+            "JOIN users u ON u.id = o.artist_id WHERE o.request_id = ? AND o.status = 'pending' ORDER BY o.id",
+            (req_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def pending_offers_count(uid: int) -> int:
+    with db() as con:
+        return con.execute(
+            "SELECT COUNT(*) FROM offers o JOIN requests r ON r.id = o.request_id "
+            "WHERE r.user_id = ? AND r.status = 'open' AND o.status = 'pending'", (uid,)).fetchone()[0]
+
+
+def create_offer(artist_id: int, req_id: int, amount: float, currency: str, message: str) -> None:
+    with db() as con:
+        con.execute("INSERT INTO offers(request_id, artist_id, amount, currency, message) VALUES (?, ?, ?, ?, ?)",
+                    (req_id, artist_id, amount, currency, message))
+
+
+def reject_offer(uid: int, offer_id: int) -> None:
+    with db() as con:
+        con.execute("UPDATE offers SET status = 'rejected' WHERE id = ? AND request_id IN "
+                    "(SELECT id FROM requests WHERE user_id = ?)", (offer_id, uid))
+
+
+def withdraw_offer(artist_id: int, offer_id: int) -> None:
+    with db() as con:
+        con.execute("UPDATE offers SET status = 'withdrawn' WHERE id = ? AND artist_id = ? AND status = 'pending'",
+                    (offer_id, artist_id))
+
+
+def accept_offer(uid: int, offer: dict, req: dict) -> None:
+    """La persona acepta y paga: el dinero queda retenido hasta que el artista entregue el sonido."""
+    with db() as con:
+        con.execute("UPDATE offers SET status = 'accepted' WHERE id = ?", (offer["id"],))
+        con.execute("UPDATE offers SET status = 'rejected' WHERE request_id = ? AND id != ? AND status = 'pending'",
+                    (req["id"], offer["id"]))
+        con.execute("UPDATE requests SET status = 'in_progress', artist_id = ?, agreed_amount = ?, "
+                    "agreed_currency = ? WHERE id = ? AND user_id = ?",
+                    (offer["artist_id"], offer["amount"], offer["currency"], req["id"], uid))
+        record_payment(con, uid, offer["artist_id"], "request", req["id"], f"Pedido: {req['text'][:60]}",
+                       offer["amount"], offer["currency"], "held")
+
+
+def close_request(uid: int, req_id: int) -> None:
+    with db() as con:
+        con.execute("UPDATE requests SET status = 'closed' WHERE id = ? AND user_id = ? AND status = 'open'",
+                    (req_id, uid))
+        con.execute("UPDATE offers SET status = 'rejected' WHERE request_id = ? AND status = 'pending'", (req_id,))
+
+
+def artist_jobs(artist_id: int) -> list[dict]:
+    with db() as con:
+        rows = con.execute(
+            "SELECT o.id AS offer_id, o.amount, o.currency, o.message, o.status AS offer_status, r.*, "
+            "u.username, u.display_name FROM offers o JOIN requests r ON r.id = o.request_id "
+            "JOIN users u ON u.id = r.user_id WHERE o.artist_id = ? AND o.status IN ('pending', 'accepted', 'rejected') "
+            "ORDER BY o.id DESC", (artist_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def deliver_request(artist_id: int, req_id: int, uploaded) -> None:
+    ext = Path(uploaded.name).suffix.lower()
+    name = f"{uuid.uuid4().hex[:12]}{ext}"
+    (REQUESTS_DIR / name).write_bytes(uploaded.getvalue())
+    with db() as con:
+        con.execute("UPDATE requests SET status = 'delivered', sound_path = ? WHERE id = ? AND artist_id = ?",
+                    (f"sounds/requests/{name}", req_id, artist_id))
+        con.execute("UPDATE payments SET status = 'released' WHERE kind = 'request' AND ref_id = ? AND status = 'held'",
+                    (req_id,))
+
+
+# ------------------------------------------------------------------ OBS
+def ensure_obs_token(uid: int, regenerate: bool = False) -> str:
+    u = get_user(uid)
+    if u.get("obs_token") and not regenerate:
+        return u["obs_token"]
+    token = secrets.token_urlsafe(18)
+    with db() as con:
+        con.execute("UPDATE users SET obs_token = ? WHERE id = ?", (token, uid))
+    return token
+
+
+def user_by_obs_token(token: str) -> dict | None:
+    with db() as con:
+        row = con.execute("SELECT * FROM users WHERE obs_token = ?", (token,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_stream_settings(uid: int, **fields) -> None:
+    allowed = {"twitch_channel", "twitch_client_id", "twitch_token", "chat_enabled", "chat_prefix", "obs_cooldown"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if fields:
+        with db() as con:
+            con.execute(f"UPDATE users SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                        (*fields.values(), uid))
+
+
 # ================================================================== ARCHIVOS
 def get_duration(path: Path) -> float | None:
     if path.suffix.lower() == ".wav":
@@ -672,12 +1019,17 @@ def duration_from_bytes(data: bytes, ext: str) -> float | None:
         p.unlink(missing_ok=True)
 
 
-def save_uploaded_sound(username: str, uploaded) -> str:
+def save_uploaded_sound(username: str, uploaded, plan: dict | None = None) -> str:
     ext = Path(uploaded.name).suffix.lower()
+    data = uploaded.getvalue()
+    if plan is not None:
+        data, ext, note = conform_quality(data, ext, plan)
+        if note:
+            flash(note, ":material/high_quality:")
     folder = USER_SOUNDS_DIR / username.lower()
     folder.mkdir(parents=True, exist_ok=True)
     fname = f"{uuid.uuid4().hex[:12]}{ext}"
-    (folder / fname).write_bytes(uploaded.getvalue())
+    (folder / fname).write_bytes(data)
     return f"sounds/users/{username.lower()}/{fname}"
 
 
@@ -935,6 +1287,112 @@ async function drawWave(b){
 </script></body></html>"""
 
 
+OVERLAY_TEMPLATE = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;background:transparent;font-family:'Segoe UI',system-ui,sans-serif;color:#fff;overflow:hidden}
+body{min-height:240px}
+#feed{position:fixed;left:16px;bottom:16px;display:flex;flex-direction:column;gap:8px}
+.note{--c:#ff6a00;display:flex;align-items:center;gap:12px;padding:8px 18px 8px 8px;border-radius:999px;
+ background:rgba(20,16,14,.9);border:2px solid var(--c);box-shadow:0 6px 18px rgba(0,0,0,.4);
+ animation:in .25s ease-out, out .4s ease-in 3.6s forwards}
+.ic{width:38px;height:38px;border-radius:50%;background:var(--c);display:flex;align-items:center;justify-content:center;overflow:hidden;flex:none}
+.ic svg{width:22px;height:22px;color:#fff}.ic img{width:100%;height:100%;object-fit:cover}
+.t b{display:block;font-size:16px}.t span{font-size:13px;opacity:.75}
+@keyframes in{from{transform:translateY(12px);opacity:0}}@keyframes out{to{opacity:0;transform:translateY(-6px)}}
+#test{display:none;padding:12px 14px;background:rgba(20,16,14,.92);border-radius:14px;margin:8px;max-width:760px}
+#test.on{display:block}#status{font-size:13px;opacity:.85;margin-bottom:8px;line-height:1.5}
+#chips button{--c:#ff6a00;margin:3px;padding:6px 12px;border-radius:999px;border:none;background:var(--c);color:#fff;font-weight:600;cursor:pointer}
+</style></head>
+<body><div id="test"><div id="status">Conectando…</div><div id="chips"></div></div><div id="feed"></div>
+<script>
+const DATA = __DATA__, CFG = __CFG__;
+const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+const byName = {}; DATA.forEach(b => byName[norm(b.name)] = b);
+const AC = window.AudioContext || window.webkitAudioContext, ctx = new AC();
+const buffers = {}, last = {};
+function b64ToBuf(b64){const bin=atob(b64);const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return u.buffer;}
+DATA.forEach(b => { buffers[b.id] = b.audio ? new Promise(r => ctx.decodeAudioData(b64ToBuf(b.audio), r, () => r(null))) : Promise.resolve(null); });
+const statusLines = {};
+function status(key, text){ statusLines[key] = text; document.getElementById('status').innerHTML =
+  Object.values(statusLines).map(t => t.replace(/</g,'&lt;')).join('<br>'); console.log('[SoundSet]', text); }
+
+async function play(b){
+  if (ctx.state !== 'running') { try { await ctx.resume(); } catch(e){} }
+  const buf = await buffers[b.id]; if (!buf) return;
+  const s = Math.min(Math.max(b.start || 0, 0), buf.duration);
+  const e = (b.end && b.end > s) ? Math.min(b.end, buf.duration) : buf.duration;
+  const src = ctx.createBufferSource(), g = ctx.createGain();
+  src.buffer = buf; g.gain.value = b.volume ?? 1; src.connect(g); g.connect(ctx.destination);
+  src.start(0, s, Math.max(0.02, e - s));
+}
+function notify(b, who, via){
+  const n = document.createElement('div'); n.className = 'note'; n.style.setProperty('--c', b.color);
+  const ic = document.createElement('div'); ic.className = 'ic';
+  if (b.img) { const im = document.createElement('img'); im.src = b.img; ic.appendChild(im); } else ic.innerHTML = b.svg;
+  const t = document.createElement('div'); t.className = 't';
+  const nb = document.createElement('b'); nb.textContent = b.name;
+  const ns = document.createElement('span'); ns.textContent = who ? `${who} · ${via}` : via;
+  t.append(nb, ns); n.append(ic, t);
+  document.getElementById('feed').appendChild(n); setTimeout(() => n.remove(), 4100);
+}
+function trigger(name, who, via){
+  const b = byName[norm(name)];
+  if (!b) { status('last', `Sin botón llamado «${name}»`); return; }
+  const now = Date.now();
+  if (CFG.cooldown && last[b.id] && now - last[b.id] < CFG.cooldown * 1000) return;  // enfriamiento por sonido
+  last[b.id] = now; play(b); notify(b, who, via);
+}
+
+// ---- Puntos del canal (Twitch EventSub por WebSocket)
+async function subscribe(sessionId){
+  const h = {'Client-Id': CFG.clientId, 'Authorization': 'Bearer ' + CFG.token, 'Content-Type': 'application/json'};
+  try {
+    const me = await (await fetch('https://api.twitch.tv/helix/users', {headers: h})).json();
+    if (!me.data || !me.data.length) { status('pts', 'Puntos del canal: el token no es válido o venció.'); return; }
+    const r = await fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {method: 'POST', headers: h, body: JSON.stringify({
+      type: 'channel.channel_points_custom_reward_redemption.add', version: '1',
+      condition: {broadcaster_user_id: me.data[0].id}, transport: {method: 'websocket', session_id: sessionId}})});
+    status('pts', r.ok ? `Puntos del canal conectados (${me.data[0].display_name})` : `Puntos del canal: error ${r.status}. Revisa el permiso channel:read:redemptions.`);
+  } catch(e) { status('pts', 'Puntos del canal: no se pudo conectar con Twitch.'); }
+}
+function eventsub(url){
+  const ws = new WebSocket(url || 'wss://eventsub.wss.twitch.tv/ws'); let moved = false;
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data), type = m.metadata && m.metadata.message_type;
+    if (type === 'session_welcome' && !url) subscribe(m.payload.session.id);
+    else if (type === 'notification' && m.payload.subscription.type === 'channel.channel_points_custom_reward_redemption.add') {
+      const e = m.payload.event; trigger(e.reward.title, e.user_name, 'puntos del canal');
+    } else if (type === 'session_reconnect') { moved = true; eventsub(m.payload.session.reconnect_url); }
+  };
+  ws.onclose = () => { if (!moved) { status('pts', 'Puntos del canal: reconectando…'); setTimeout(() => eventsub(), 5000); } };
+}
+
+// ---- Comandos de chat (lectura anónima del chat de Twitch)
+function chat(){
+  const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443'), prefix = norm(CFG.prefix || '!sonido');
+  ws.onopen = () => { ws.send('CAP REQ :twitch.tv/tags'); ws.send('PASS SCHMOOPIIE');
+    ws.send('NICK justinfan' + Math.floor(Math.random() * 80000 + 1000)); ws.send('JOIN #' + CFG.channel.toLowerCase());
+    status('chat', `Chat conectado: escribe «${CFG.prefix} nombre» en #${CFG.channel}`); };
+  ws.onmessage = ev => ev.data.split('\r\n').forEach(line => {
+    if (line.startsWith('PING')) { ws.send('PONG :tmi.twitch.tv'); return; }
+    const m = line.match(/display-name=([^;]*);.* PRIVMSG #\S+ :(.*)$/);
+    if (m && norm(m[2]).startsWith(prefix + ' ')) trigger(m[2].slice(prefix.length + 1), m[1], 'chat');
+  });
+  ws.onclose = () => { status('chat', 'Chat: reconectando…'); setTimeout(chat, 5000); };
+}
+
+if (CFG.clientId && CFG.token) eventsub(); else status('pts', 'Puntos del canal: falta el Client ID o el token en SoundSet.');
+if (CFG.chat && CFG.channel) chat();
+status('n', `${DATA.length} sonidos cargados`);
+if (CFG.test) {
+  document.getElementById('test').classList.add('on');
+  const chips = document.getElementById('chips');
+  DATA.forEach(b => { const c = document.createElement('button'); c.textContent = b.name; c.style.setProperty('--c', b.color);
+    c.onclick = () => trigger(b.name, 'prueba', 'clic'); chips.appendChild(c); });
+}
+</script></body></html>"""
+
+
 def button_payload(b: dict, audio_b64: str | None = None) -> dict:
     if audio_b64 is None:
         path = BASE_DIR / b["sound_path"]
@@ -959,6 +1417,11 @@ def build_pad_html(payload: list[dict], mode: str = "pad", nonce: int = 0) -> st
     return (PAD_TEMPLATE.replace("__DATA__", data)
             .replace("__MODE__", mode)
             .replace("__NONCE__", f"stop-{nonce}"))
+
+
+def build_overlay_html(payload: list[dict], cfg: dict) -> str:
+    dump = lambda x: json.dumps(x, ensure_ascii=False).replace("</", "<\\/")
+    return OVERLAY_TEMPLATE.replace("__DATA__", dump(payload)).replace("__CFG__", dump(cfg))
 
 
 def show_html(content: str, height: int) -> None:
@@ -1052,6 +1515,43 @@ div[data-baseweb="tab-list"] button[aria-selected="true"] p { color: #ffa04d; }
 [class*="st-key-del_"] button { border-color: #5a1f1c !important; color: #ff5a52 !important; }
 [class*="st-key-del_"] button:hover { background: #e5322b !important; border-color: #e5322b !important; color: #fff !important; }
 .st-key-dlg_del button { background: #e5322b !important; border: none !important; color: #fff !important; }
+/* burbujas de Imaginación */
+.ss-bubble { --b: #e53935; position: relative; padding: 1.4rem 1.6rem 1.1rem; margin: .4rem 0 .6rem;
+  background: color-mix(in srgb, var(--b) 15%, #14100e);
+  border: 1.5px solid color-mix(in srgb, var(--b) 42%, transparent);
+  color: color-mix(in srgb, var(--b) 68%, #cfc5bd);
+  border-radius: 46% 54% 52% 48% / 38% 42% 58% 62%;
+  box-shadow: inset 0 0 38px color-mix(in srgb, var(--b) 16%, transparent);
+  animation: ss-float 7s ease-in-out infinite; }
+.ss-bubble:nth-child(even) { animation-delay: -3s; }
+.ss-bubble p { font-weight: 600; font-size: 1.02rem; line-height: 1.4; margin: 0 0 .6rem; color: inherit; text-align: center; }
+.ss-bubble.big { max-width: 560px; min-height: 270px; margin: .8rem auto .4rem; padding: 2.6rem 3.2rem 2rem;
+  border-radius: 50%; display: flex; flex-direction: column; justify-content: center; }
+.ss-bubble.big p { font-size: 1.45rem; }
+.ss-bubble .meta { display: flex; justify-content: center; gap: .9rem; flex-wrap: wrap; font-size: .82rem;
+  color: color-mix(in srgb, var(--b) 45%, #9a8f86); }
+.ss-bubble .price { font-weight: 700; color: color-mix(in srgb, var(--b) 75%, #e8ddd5); }
+@keyframes ss-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+@media (prefers-reduced-motion: reduce) { .ss-bubble { animation: none; } }
+.ss-hero { padding: .4rem 0 1rem; }
+.ss-hero h1 { display: inline-block; font-size: 3rem; font-weight: 800; letter-spacing: -1.5px; margin: 0; padding: 0;
+  background: linear-gradient(90deg, #e53935, #ff6d00, #f9b800, #2e9e4f, #1e6fe0, #8e24aa, #e91e7a);
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.ss-dots { display: flex; gap: 6px; margin: .2rem 0 .6rem; }
+.ss-dots i { width: 14px; height: 14px; border-radius: 50%; display: block; opacity: .85; }
+.ss-badge { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600;
+  background: #2a211c; color: #d9cfc6; border: 1px solid #3a2e27; }
+.ss-badge.orange { background: #ff6a00; color: #1a1613; border-color: #ff6a00; }
+/* planes */
+.ss-plan { border: 1px solid #2f2621; border-radius: 22px; padding: 1.4rem 1.4rem .6rem; background: #17120f;
+  box-sizing: border-box; height: 24rem !important; margin-bottom: .7rem; }
+.ss-plan.current { border: 2px solid #ff6a00; }
+.ss-plan h3 { margin: 0; padding: 0; font-weight: 700; }
+.ss-plan .pr { font-size: 2.2rem; font-weight: 800; color: #ff8a2a; margin: .3rem 0 .1rem; }
+.ss-plan .pr small { font-size: .95rem; color: #9a8f86; font-weight: 500; }
+.ss-plan ul { padding-left: 1.1rem; margin: .8rem 0; color: #d9cfc6; }
+.ss-plan li { margin: .35rem 0; }
+.st-key-hide_ui { display: none; }
 #MainMenu, footer { visibility: hidden; }
 </style>
 """
@@ -1073,12 +1573,11 @@ def avatar_html(u: dict, size: int = 40) -> str:
 
 
 def flash(msg: str, icon: str = ":material/check_circle:") -> None:
-    st.session_state.flash = (msg, icon)
+    st.session_state.setdefault("flash", []).append((msg, icon))
 
 
 def show_flash() -> None:
-    if "flash" in st.session_state:
-        msg, icon = st.session_state.pop("flash")
+    for msg, icon in st.session_state.pop("flash", []):
         st.toast(msg, icon=icon)
 
 
@@ -1161,9 +1660,17 @@ def sidebar(me: dict, n_buttons: int) -> str:
         st.markdown(
             f'<div class="ss-me">{avatar_html(me, 44)}<div><div class="ss-me-name">'
             f'{esc(me.get("display_name") or me["username"])}</div>'
-            f'<div class="ss-muted">@{esc(me["username"])} · {n_buttons} botones</div></div></div>',
+            f'<div class="ss-muted">@{esc(me["username"])}</div></div></div>',
             unsafe_allow_html=True,
         )
+        plan = plan_of(me)
+        limit = "∞" if plan["limit"] is None else plan["limit"]
+        st.markdown(f'<div style="margin-top:.6rem"><span class="ss-badge{" orange" if plan["price"] else ""}">'
+                    f'Plan {plan["name"]}</span> <span class="ss-muted">{n_buttons}/{limit} sonidos</span></div>',
+                    unsafe_allow_html=True)
+        offers = pending_offers_count(me["id"])
+        if offers:
+            st.caption(f"Tienes {offers} oferta(s) nueva(s) en Imaginación.")
         st.divider()
         page = st.radio("Menú", PAGES, key="page", label_visibility="collapsed")
         st.divider()
@@ -1188,6 +1695,35 @@ def page_header(title: str, target: str, label: str, icon: str) -> None:
     t, b = st.columns([4, 1.2], vertical_alignment="bottom")
     t.markdown(f"## {title}")
     b.button(label, icon=icon, on_click=go_to, args=(target,), width="stretch", key=f"go_{title}")
+
+
+def can_add(me: dict, n_buttons: int, key: str, needed: int = 1) -> bool:
+    """Muestra un aviso con acceso a Planes si el plan no permite agregar más sonidos."""
+    if room_left(me, n_buttons) >= needed:
+        return True
+    plan = plan_of(me)
+    st.warning(f"Tu plan {plan['name']} permite hasta {plan['limit']} sonidos y ya tienes {n_buttons}. "
+               "Mejora tu plan para agregar más.", icon=":material/lock:")
+    st.button("Ver planes", key=f"upgrade_{key}", icon=":material/workspace_premium:", on_click=go_to,
+              args=(PAGE_PLANS,))
+    return False
+
+
+@st.dialog("Pagar")
+def checkout(title: str, amount: float, currency: str, action, *args) -> None:
+    st.markdown(f"**{esc(title)}**")
+    st.markdown(f"Total: **{fmt_money(amount, currency)}**")
+    if PAYMENT_MODE == "demo":
+        st.info("Modo demo: no se cobra dinero real. Cuando conectes una pasarela de pago, aquí se abrirá "
+                "el pago seguro.", icon=":material/info:")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancelar", key="co_cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Pagar", key="co_pay", type="primary", icon=":material/lock:", width="stretch"):
+        if process_payment(amount, currency, title):
+            action(*args)
+            flash("Pago aprobado.", ":material/verified:")
+            st.rerun()
 
 
 def open_editor(bid: int) -> None:
@@ -1232,8 +1768,10 @@ def render_edit_grid(me: dict, buttons: list[dict], per_row: int = 5) -> None:
             with col:
                 if b is None:
                     st.markdown(ADD_TILE, unsafe_allow_html=True)
-                    st.button("Agregar", key="tile_add", icon=":material/add:", on_click=go_to,
-                              args=(PAGE_ADD,), width="stretch")
+                    full = room_left(me, len(buttons)) <= 0
+                    st.button("Mejorar plan" if full else "Agregar", key="tile_add",
+                              icon=":material/workspace_premium:" if full else ":material/add:",
+                              on_click=go_to, args=(PAGE_PLANS if full else PAGE_ADD,), width="stretch")
                     continue
                 st.markdown(tile_html(b), unsafe_allow_html=True)
                 left, right = st.columns(2, gap="small")
@@ -1264,9 +1802,13 @@ def page_pad(me: dict, buttons: list[dict]) -> None:
     show_html(build_pad_html(payload, "pad", st.session_state.stop_nonce), 110 + rows * 185)
 
 
-def page_add(user: dict) -> None:
+def page_add(user: dict, n_buttons: int) -> None:
     v = st.session_state.setdefault("add_ver", 0)
     page_header("Agregar botón", PAGE_PAD, "Mi SoundPad", ":material/grid_view:")
+    plan = plan_of(user)
+    if not can_add(user, n_buttons, "add"):
+        return
+    st.caption(f"Plan {plan['name']}: {plan['quality']}.")
     c1, c2 = st.columns(2, gap="large")
     with c1:
         name = st.text_input("Nombre del botón", max_chars=24, key=f"add_name_{v}", placeholder="Ej: Risa malvada")
@@ -1300,7 +1842,7 @@ def page_add(user: dict) -> None:
             img_b64, img_mime = image_to_b64(img)
             add_button(
                 user["id"], name=name.strip(), icon=icon, image_b64=img_b64, image_mime=img_mime, color=color,
-                sound_path=save_uploaded_sound(user["username"], snd), start_s=float(start),
+                sound_path=save_uploaded_sound(user["username"], snd, plan), start_s=float(start),
                 end_s=None if (end is None or end >= dur - 0.01) else float(end), volume=float(volume),
             )
             st.session_state.add_ver = v + 1
@@ -1313,7 +1855,8 @@ def page_edit(user: dict, buttons: list[dict]) -> None:
     page_header("Editar botones", PAGE_PAD, "Mi SoundPad", ":material/grid_view:")
     if not buttons:
         st.info("Tu set está vacío. Agrega un botón nuevo, guarda uno de la comunidad o recupera los de ejemplo.")
-        if st.button("Recuperar los 10 botones de ejemplo", type="primary", icon=":material/restore:"):
+        if can_add(user, 0, "seed0", needed=len(DEFAULT_SOUNDS)) and st.button(
+                "Recuperar los 10 botones de ejemplo", type="primary", icon=":material/restore:"):
             seed_default_buttons(user["id"])
             flash("Botones de ejemplo agregados.")
             st.rerun()
@@ -1374,7 +1917,7 @@ def page_edit(user: dict, buttons: list[dict]) -> None:
                       end_s=None if end >= dur - 0.01 else float(end), volume=float(volume))
         old_path = b["sound_path"]
         if new_snd is not None:
-            fields["sound_path"] = save_uploaded_sound(user["username"], new_snd)
+            fields["sound_path"] = save_uploaded_sound(user["username"], new_snd, plan_of(user))
         update_button(user["id"], bid, **fields)
         if new_snd is not None:
             cleanup_sound(old_path)
@@ -1397,13 +1940,14 @@ def page_edit(user: dict, buttons: list[dict]) -> None:
             st.rerun()
 
     st.divider()
-    if st.button("Agregar otra vez los 10 botones de ejemplo", icon=":material/restore:"):
+    if room_left(user, len(buttons)) >= len(DEFAULT_SOUNDS) and st.button(
+            "Agregar otra vez los 10 botones de ejemplo", icon=":material/restore:"):
         seed_default_buttons(user["id"])
         flash("Botones de ejemplo agregados al final de tu set.")
         st.rerun()
 
 
-def community_card(item: dict, me: dict) -> None:
+def community_card(item: dict, me: dict, n_buttons: int) -> None:
     with st.container(border=True):
         show_html(build_pad_html([button_payload({**item, "id": f"c{item['id']}"})], "mini",
                                  st.session_state.stop_nonce), 112)
@@ -1415,23 +1959,29 @@ def community_card(item: dict, me: dict) -> None:
         )
         if item["description"]:
             st.caption(item["description"])
-        st.caption(f"{item['saves']} guardados · {item['downloads']} descargas")
+        price = float(item.get("price_usd") or 0)
+        price_txt = (f" · descarga {fmt_money(price, 'USD')} (usarlo en tu SoundPad es gratis)" if price else
+                     " · descarga gratis")
+        st.caption(f"{item['saves']} guardados · {item['downloads']} descargas{price_txt}")
 
         c1, c2, c3 = st.columns([1.2, 1.2, 0.6])
-        if item["saved_by_me"]:
-            if c1.button("Guardar otra vez", key=f"save_{item['id']}", icon=":material/bookmark_added:",
-                         width="stretch", help="Ya está en tu set; puedes agregar otra copia."):
-                save_from_community(me["id"], me["username"], item)
-                flash(f"«{item['name']}» agregado otra vez a tu set.")
-                st.rerun()
-        elif c1.button("Guardar", key=f"save_{item['id']}", icon=":material/bookmark_add:", type="primary",
-                       width="stretch"):
+        full = room_left(me, n_buttons) <= 0
+        save_label = "Guardar otra vez" if item["saved_by_me"] else "Guardar"
+        if c1.button(save_label, key=f"save_{item['id']}", width="stretch",
+                     icon=":material/bookmark_added:" if item["saved_by_me"] else ":material/bookmark_add:",
+                     type="secondary" if item["saved_by_me"] else "primary", disabled=full,
+                     help="Tu plan llegó al máximo de sonidos." if full else "Agrega una copia a tu SoundPad."):
             save_from_community(me["id"], me["username"], item)
             flash(f"«{item['name']}» guardado en tu SoundPad.")
             st.rerun()
 
         path = BASE_DIR / item["sound_path"]
-        if path.exists():
+        locked = price > 0 and item["author_id"] != me["id"] and not item["bought_by_me"]
+        if locked:
+            if c2.button(f"Comprar {fmt_money(price, 'USD')}", key=f"buy_{item['id']}",
+                         icon=":material/shopping_cart:", width="stretch"):
+                checkout(f"Descarga de «{item['name']}»", price, "USD", buy_download, me["id"], item)
+        elif path.exists():
             ext = path.suffix.lower()
             c2.download_button(
                 "Descargar", data=path.read_bytes(), file_name=f"{slugify(item['name'])}{ext}",
@@ -1470,12 +2020,19 @@ def page_community(me: dict, buttons: list[dict]) -> None:
             pv = st.session_state.setdefault("pub_ver", 0)
             desc = st.text_area("Descripción (opcional)", max_chars=140, key=f"pub_desc_{pv}",
                                 placeholder="Ej: ideal para cuando alguien se equivoca en la partida")
-            st.caption("Al publicarlo, cualquier persona con cuenta podrá escucharlo, guardarlo y descargarlo.")
+            price = 0.0
+            if plan_of(me)["sell"]:
+                price = st.number_input("Precio para descargar (USD)", 0.0, 100.0, 0.0, 0.5, key=f"pub_price_{pv}",
+                                        help="0 = gratis. Guardarlo y usarlo en SoundSet siempre es gratis; "
+                                             "el precio es solo para descargar el archivo.")
+            else:
+                st.caption("Con Premium o SoundSet puedes cobrar por la descarga de tus sonidos.")
+            st.caption("Al publicarlo, cualquier persona con cuenta podrá escucharlo y guardarlo en su SoundPad.")
             if st.button("Publicar en la comunidad", type="primary", icon=":material/public:"):
                 if not (BASE_DIR / pb["sound_path"]).exists():
                     st.error("No se encontró el archivo de sonido de este botón. Reemplázalo en Editar botones.")
                 else:
-                    publish_button(me["id"], pb, desc.strip())
+                    publish_button(me["id"], pb, desc.strip(), float(price))
                     st.session_state.pub_ver = pv + 1
                     flash(f"«{pb['name']}» publicado en la comunidad.", ":material/public:")
                     st.rerun()
@@ -1503,7 +2060,7 @@ def page_community(me: dict, buttons: list[dict]) -> None:
     cols = st.columns(3, gap="medium")
     for i, item in enumerate(chunk):
         with cols[i % 3]:
-            community_card(item, me)
+            community_card(item, me, len(buttons))
 
 
 def page_profile(me: dict) -> None:
@@ -1523,6 +2080,16 @@ def page_profile(me: dict) -> None:
                 f'<div><b>{stats["saves"]}</b><span>guardados por otros</span></div></div></div>',
                 unsafe_allow_html=True,
             )
+        e = earnings(me["id"])
+        if e["available"] or e["held"]:
+            with st.container(border=True):
+                st.markdown("**Ganancias**")
+                for cur_, amt in e["available"].items():
+                    st.markdown(f"Disponible: **{fmt_money(amt, cur_)}**")
+                for cur_, amt in e["held"].items():
+                    st.markdown(f"Retenido hasta entregar: {fmt_money(amt, cur_)}")
+                if PAYMENT_MODE == "demo":
+                    st.caption("Modo demo: los montos son de prueba y no se pueden retirar.")
     with c2:
         pv = st.session_state.setdefault("profile_ver", 0)
         with st.form(f"profile_form_{pv}"):
@@ -1569,10 +2136,405 @@ def page_profile(me: dict) -> None:
                     st.success("Contraseña cambiada.")
 
 
+
+# ================================================================== IMAGINACIÓN (Inicio)
+BUBBLE_NAMES = ["Rojo", "Naranja", "Amarillo", "Verde", "Cian", "Azul", "Índigo", "Morado", "Rosa"]
+BUBBLE_COLORS = [COLORS[n] for n in BUBBLE_NAMES]
+
+
+def bubble_html(r: dict, big: bool = False) -> str:
+    price = (f"Paga {fmt_money(r['budget'], r['currency'])}" if r["kind"] == "budget"
+             else "Recibe ofertas de precio")
+    return (f'<div class="ss-bubble{" big" if big else ""}" style="--b:{esc(r["color"])}">'
+            f'<p>{esc(r["text"])}</p><div class="meta"><span>@{esc(r["username"])}</span>'
+            f'<span class="price">{price}</span></div></div>')
+
+
+def imagination_form(me: dict) -> None:
+    v = st.session_state.setdefault("req_ver", 0)
+    with st.container(border=True):
+        text = st.text_area("¿Qué sonido imaginas?", max_chars=220, key=f"req_text_{v}",
+                            placeholder="Quiero un sonido de un gato roncando y que de repente suene una explosión")
+        mode = st.radio("Precio", ["Que los artistas me ofrezcan un precio", "Yo pongo cuánto pagaré"],
+                        horizontal=True, key=f"req_mode_{v}", label_visibility="collapsed")
+        c1, c2, c3 = st.columns([1.2, 0.8, 1.2])
+        budget = currency = None
+        if mode.startswith("Yo"):
+            currency = c2.selectbox("Moneda", CURRENCIES, key=f"req_cur_{v}")
+            clp = currency == "CLP"
+            budget = c1.number_input("Pagaré", min_value=1.0, value=10500.0 if clp else 10.0,
+                                     step=500.0 if clp else 1.0, format="%.0f" if clp else "%.2f",
+                                     key=f"req_budget_{v}_{currency}")
+        color_name = c3.selectbox("Color de la burbuja", ["Al azar", *BUBBLE_NAMES], key=f"req_color_{v}")
+        if st.button("Lanzar burbuja", type="primary", icon=":material/bubble_chart:", key="req_send"):
+            if len(text.strip()) < 8:
+                st.error("Describe un poco más el sonido que imaginas (mínimo 8 caracteres).")
+            else:
+                color = random.choice(BUBBLE_COLORS) if color_name == "Al azar" else COLORS[color_name]
+                create_request(me["id"], text.strip(), "budget" if budget else "offers", budget, currency, color)
+                st.session_state.req_ver = v + 1
+                flash("Tu burbuja ya está flotando para los artistas.", ":material/bubble_chart:")
+                st.rerun()
+
+
+def offer_form(me: dict, r: dict, prefix: str) -> None:
+    with st.container(border=True):
+        if r["kind"] == "budget":
+            amount, currency = float(r["budget"]), r["currency"]
+            st.markdown(f"Esta persona pagará **{fmt_money(amount, currency)}**. Si confirmas, ella decide si te lo encarga.")
+        else:
+            c1, c2 = st.columns([2, 1])
+            currency = c2.selectbox("Moneda", CURRENCIES, key=f"{prefix}_cur_{r['id']}")
+            clp = currency == "CLP"
+            amount = c1.number_input("¿Cuánto cobras?", min_value=1.0, value=5000.0 if clp else 5.0,
+                                     step=500.0 if clp else 1.0, format="%.0f" if clp else "%.2f",
+                                     key=f"{prefix}_amt_{r['id']}_{currency}")
+        msg = st.text_input("Mensaje para la persona (opcional)", max_chars=160, key=f"{prefix}_msg_{r['id']}",
+                            placeholder="Ej: lo tengo listo en 2 días, con 3 versiones")
+        b1, b2 = st.columns(2)
+        label = "Confirmar: lo hago" if r["kind"] == "budget" else "Enviar oferta"
+        if b1.button(label, type="primary", key=f"{prefix}_send_{r['id']}", icon=":material/send:", width="stretch"):
+            create_offer(me["id"], r["id"], float(amount), currency, msg.strip())
+            st.session_state.pop("offer_for", None)
+            flash("Oferta enviada. Verás la respuesta en «Mis trabajos».", ":material/send:")
+            st.rerun()
+        if b2.button("Cancelar", key=f"{prefix}_cancel_{r['id']}", width="stretch"):
+            st.session_state.pop("offer_for", None)
+            st.rerun()
+
+
+@st.fragment(run_every=15)
+def bubble_feed(me: dict) -> None:
+    """Una burbuja grande que cambia sola cada 15 segundos."""
+    reqs = [r for r in open_requests(me["id"]) if not r["offered"]]
+    if not reqs:
+        st.info("No hay burbujas nuevas por ahora. Vuelve en un rato.", icon=":material/bubble_chart:")
+        return
+    frozen = st.session_state.get("offer_for")
+    idx = next((i for i, x in enumerate(reqs) if x["id"] == frozen), None)
+    if idx is None:
+        idx = (int(time.time() // 15) + st.session_state.get("bubble_offset", 0)) % len(reqs)
+    r = reqs[idx]
+    st.markdown(bubble_html(r, big=True), unsafe_allow_html=True)
+    st.markdown(f'<p class="ss-muted" style="text-align:center">Burbuja {idx + 1} de {len(reqs)} · '
+                'cambia sola cada 15 segundos</p>', unsafe_allow_html=True)
+    if frozen == r["id"]:
+        offer_form(me, r, "feat")
+        return
+    _, c1, c2, _ = st.columns([1, 1.2, 1, 1])
+    if c1.button("Lo hago" if r["kind"] == "budget" else "Ofrecer ayuda", type="primary",
+                 key=f"feat_take_{r['id']}", icon=":material/handshake:", width="stretch"):
+        st.session_state.offer_for = r["id"]
+        st.rerun(scope="fragment")
+    if c2.button("Pasar", key=f"feat_pass_{r['id']}", icon=":material/skip_next:", width="stretch"):
+        st.session_state.bubble_offset = st.session_state.get("bubble_offset", 0) + 1
+        st.rerun(scope="fragment")
+
+
+def all_bubbles(me: dict) -> None:
+    reqs = open_requests(me["id"])
+    if not reqs:
+        st.info("No hay burbujas abiertas por ahora.")
+        return
+    cols = st.columns(3, gap="medium")
+    for i, r in enumerate(reqs):
+        with cols[i % 3]:
+            st.markdown(bubble_html(r), unsafe_allow_html=True)
+            if st.session_state.get("offer_for") == r["id"]:
+                offer_form(me, r, "all")
+            elif r["offered"]:
+                st.button("Oferta enviada", key=f"all_sent_{r['id']}", disabled=True, width="stretch",
+                          icon=":material/check:")
+            elif st.button("Lo hago" if r["kind"] == "budget" else "Ofrecer ayuda", key=f"all_take_{r['id']}",
+                           icon=":material/handshake:", width="stretch"):
+                st.session_state.offer_for = r["id"]
+                st.rerun()
+
+
+def my_requests_view(me: dict, n_buttons: int) -> None:
+    reqs = my_requests(me["id"])
+    if not reqs:
+        st.info("Aún no lanzas burbujas. Describe arriba el sonido que imaginas.")
+        return
+    for r in reqs:
+        with st.container(border=True):
+            c1, c2 = st.columns([1, 1.5], gap="large")
+            c1.markdown(bubble_html(r), unsafe_allow_html=True)
+            with c2:
+                if r["status"] == "open":
+                    offers = request_offers(r["id"])
+                    if not offers:
+                        st.caption("Esperando que algún artista tome tu burbuja…")
+                    for o in offers:
+                        st.markdown(
+                            f'<div class="ss-author">{avatar_html(o, 28)}<span><b>{esc(o.get("display_name") or o["username"])}</b> '
+                            f'<span class="ss-muted">@{esc(o["username"])}</span> · '
+                            f'<b style="color:#ff8a2a">{fmt_money(o["amount"], o["currency"])}</b></span></div>',
+                            unsafe_allow_html=True)
+                        if o["message"]:
+                            st.caption(o["message"])
+                        a, b = st.columns(2)
+                        if a.button("Aceptar y pagar", key=f"acc_{o['id']}", type="primary", width="stretch",
+                                    icon=":material/check_circle:"):
+                            checkout(f"Encargo a @{o['username']}", o["amount"], o["currency"],
+                                     accept_offer, me["id"], o, r)
+                        if b.button("Rechazar", key=f"rej_{o['id']}", width="stretch", icon=":material/close:"):
+                            reject_offer(me["id"], o["id"])
+                            flash("Oferta rechazada.", ":material/close:")
+                            st.rerun()
+                    if st.button("Quitar mi burbuja", key=f"close_{r['id']}", type="tertiary",
+                                 icon=":material/delete:"):
+                        close_request(me["id"], r["id"])
+                        flash("Burbuja retirada.", ":material/delete:")
+                        st.rerun()
+                elif r["status"] == "in_progress":
+                    st.info(f"@{r['artist_username']} está creando tu sonido. Pagaste "
+                            f"{fmt_money(r['agreed_amount'], r['agreed_currency'])}; el pago queda retenido hasta "
+                            "la entrega.", icon=":material/hourglass_top:")
+                elif r["status"] == "delivered":
+                    st.success(f"@{r['artist_username']} entregó tu sonido.", icon=":material/celebration:")
+                    path = BASE_DIR / (r["sound_path"] or "")
+                    if path.exists():
+                        show_html(build_pad_html([button_payload({"id": f"r{r['id']}", "name": "Escuchar",
+                                                                  "icon": "wave", "color": r["color"],
+                                                                  "sound_path": r["sound_path"]})], "mini",
+                                                 st.session_state.stop_nonce), 112)
+                        a, b = st.columns(2)
+                        if a.button("Guardar en mi set", key=f"rsave_{r['id']}", type="primary", width="stretch",
+                                    icon=":material/bookmark_add:", disabled=room_left(me, n_buttons) <= 0):
+                            save_request_sound(me["id"], me["username"], r)
+                            flash("Sonido guardado en tu SoundPad.")
+                            st.rerun()
+                        b.download_button("Descargar", data=path.read_bytes(), key=f"rdl_{r['id']}",
+                                          file_name=f"{slugify(r['text'][:30])}{path.suffix}", width="stretch",
+                                          icon=":material/download:")
+
+
+def jobs_view(me: dict) -> None:
+    jobs = artist_jobs(me["id"])
+    if not jobs:
+        st.info("Aún no tomas burbujas. Cuando ofrezcas ayuda, tus trabajos aparecerán aquí.")
+        return
+    for j in jobs:
+        with st.container(border=True):
+            c1, c2 = st.columns([1, 1.5], gap="large")
+            c1.markdown(bubble_html(j), unsafe_allow_html=True)
+            with c2:
+                money = fmt_money(j["amount"], j["currency"])
+                if j["offer_status"] == "pending":
+                    st.caption(f"Ofreciste hacerlo por {money}. Esperando respuesta de @{j['username']}.")
+                    if st.button("Retirar oferta", key=f"wd_{j['offer_id']}", type="tertiary", icon=":material/undo:"):
+                        withdraw_offer(me["id"], j["offer_id"])
+                        st.rerun()
+                elif j["offer_status"] == "rejected":
+                    st.caption(f"@{j['username']} eligió otra opción o retiró su burbuja.")
+                elif j["status"] == "in_progress":
+                    st.success(f"¡@{j['username']} aceptó! Pagó {money}; lo recibes al entregar el sonido.",
+                               icon=":material/handshake:")
+                    up = st.file_uploader("Sube el sonido terminado (MP3 o WAV)", type=["mp3", "wav"],
+                                          key=f"deliv_{j['id']}")
+                    if st.button("Entregar sonido", key=f"deliv_btn_{j['id']}", type="primary",
+                                 icon=":material/send:", disabled=up is None):
+                        deliver_request(me["id"], j["id"], up)
+                        flash(f"Sonido entregado. Se liberó tu pago de {money}.", ":material/payments:")
+                        st.rerun()
+                else:
+                    st.caption(f"Entregado. Pago liberado: {money}.")
+
+
+def page_home(me: dict, buttons: list[dict]) -> None:
+    dots = "".join(f'<i style="background:{c}"></i>' for c in BUBBLE_COLORS)
+    st.markdown(f'<div class="ss-hero"><div class="ss-dots">{dots}</div><h1>Imaginación</h1>'
+                '<p class="ss-muted">Describe el sonido que imaginas y deja que los artistas de SoundSet lo creen '
+                'para ti.</p></div>', unsafe_allow_html=True)
+    imagination_form(me)
+
+    artist = plan_of(me)["artist"]
+    n_offers = pending_offers_count(me["id"])
+    labels = ["Burbujas", f"Mis pedidos ({n_offers})" if n_offers else "Mis pedidos"]
+    if artist:
+        labels.append("Mis trabajos")
+    tabs = st.tabs(labels)
+    with tabs[0]:
+        if artist:
+            if st.toggle("Ver todas las burbujas", key="bubbles_all"):
+                all_bubbles(me)
+            else:
+                bubble_feed(me)
+        else:
+            n = len(open_requests(me["id"]))
+            st.markdown(
+                f'<div class="ss-bubble big" style="--b:#8e24aa"><p>Hay {n} burbuja(s) esperando artistas</p>'
+                '<div class="meta"><span>Con el plan SoundSet activas el modo artista: ves los pedidos y cobras '
+                'por crear sonidos.</span></div></div>', unsafe_allow_html=True)
+            st.button("Activar modo artista", key="home_upgrade", icon=":material/workspace_premium:",
+                      on_click=go_to, args=(PAGE_PLANS,), type="primary")
+    with tabs[1]:
+        my_requests_view(me, len(buttons))
+    if artist:
+        with tabs[2]:
+            jobs_view(me)
+
+
+# ================================================================== PLANES
+PLAN_FEATURES = {
+    "free": ["Hasta 20 sonidos", PLANS["free"]["quality"], "Publica gratis en Comunidad",
+             "Pide sonidos en Imaginación"],
+    "premium": ["Hasta 100 sonidos", PLANS["premium"]["quality"],
+                "Token para OBS: tus sonidos se activan con puntos del canal de Twitch",
+                "Cobra por la descarga de tus sonidos en Comunidad"],
+    "soundset": ["Sonidos ilimitados", PLANS["soundset"]["quality"], "Todo lo de Premium: OBS y ventas",
+                 "Modo artista: ve las burbujas de Imaginación y cobra por crear sonidos"],
+}
+
+
+def page_plans(me: dict) -> None:
+    st.markdown("## Planes")
+    cur = active_plan(me)
+    if cur != "free":
+        exp = date.fromisoformat(me["plan_expires"]).strftime("%d-%m-%Y")
+        st.caption(f"Tu plan {PLANS[cur]['name']} está activo hasta el {exp}.")
+    cols = st.columns(3, gap="medium")
+    for col, (key, p) in zip(cols, PLANS.items()):
+        with col:
+            price = "Gratis" if not p["price"] else f"US${p['price']}<small> / año</small>"
+            items = "".join(f"<li>{esc(f)}</li>" for f in PLAN_FEATURES[key])
+            st.markdown(f'<div class="ss-plan{" current" if key == cur else ""}"><h3>{p["name"]}</h3>'
+                        f'<div class="pr">{price}</div><ul>{items}</ul></div>', unsafe_allow_html=True)
+            if key == cur:
+                if p["price"] and st.button("Renovar 1 año", key=f"plan_{key}", width="stretch",
+                                            icon=":material/autorenew:"):
+                    checkout(f"Renovación plan {p['name']} (1 año)", p["price"], "USD", buy_plan, me["id"], key)
+                elif not p["price"]:
+                    st.button("Tu plan actual", key=f"plan_{key}", disabled=True, width="stretch")
+            elif key == "free":
+                if st.button("Volver a Estándar", key=f"plan_{key}", width="stretch",
+                             help="No se borran tus sonidos, pero no podrás agregar más sobre el límite."):
+                    cancel_plan(me["id"])
+                    flash("Volviste al plan Estándar.")
+                    st.rerun()
+            elif st.button(f"Elegir {p['name']}", key=f"plan_{key}", type="primary", width="stretch",
+                           icon=":material/workspace_premium:"):
+                checkout(f"Plan {p['name']} (1 año)", p["price"], "USD", buy_plan, me["id"], key)
+    if PAYMENT_MODE == "demo":
+        st.caption("Los pagos están en modo demo: se registran, pero no se cobra dinero real.")
+
+    pays = my_payments(me["id"])
+    if pays:
+        with st.expander("Historial de pagos", icon=":material/receipt_long:"):
+            status_txt = {"paid": "Pagado", "held": "Retenido hasta la entrega", "released": "Liberado"}
+            st.dataframe(
+                [{"Fecha": p["created_at"][:10], "Detalle": p["description"],
+                  "Monto": fmt_money(p["amount"], p["currency"]),
+                  "Tipo": "Recibido" if p["payee_id"] == me["id"] else "Pagado",
+                  "Estado": status_txt.get(p["status"], p["status"])} for p in pays],
+                hide_index=True, width="stretch")
+
+
+# ================================================================== STREAM / OBS
+def overlay_url(token: str) -> str:
+    from urllib.parse import urlsplit
+    raw = getattr(st.context, "url", None) or "http://localhost:8501/"
+    parts = urlsplit(raw)
+    return f"{parts.scheme}://{parts.netloc}/?obs={token}"
+
+
+def page_obs(me: dict, buttons: list[dict]) -> None:
+    st.markdown("## Stream / OBS")
+    if not plan_of(me)["obs"]:
+        st.info("Con Premium o SoundSet obtienes un token para usar tus sonidos en OBS y activarlos con los "
+                "puntos del canal de Twitch.", icon=":material/lock:")
+        st.button("Ver planes", key="obs_upgrade", type="primary", icon=":material/workspace_premium:",
+                  on_click=go_to, args=(PAGE_PLANS,))
+        return
+
+    st.markdown("#### 1. Tu enlace para OBS")
+    if not me.get("obs_token"):
+        if st.button("Crear mi token", type="primary", icon=":material/key:"):
+            ensure_obs_token(me["id"])
+            st.rerun()
+        return
+    url = overlay_url(me["obs_token"])
+    st.code(url, language=None)
+    st.caption("En OBS: Fuentes → + → Navegador. Pega este enlace (ancho 800, alto 250) y marca «Controlar audio "
+               "mediante OBS». No compartas el enlace: quien lo tenga puede abrir tu overlay. Si cambias tus "
+               "botones, actualiza la fuente en OBS.")
+    c1, c2, _ = st.columns([1, 1, 2])
+    c1.link_button("Probar overlay", url + "&test=1", icon=":material/open_in_new:", width="stretch")
+    if c2.button("Regenerar token", icon=":material/refresh:", width="stretch",
+                 help="El enlace anterior deja de funcionar."):
+        ensure_obs_token(me["id"], regenerate=True)
+        flash("Token nuevo creado. Actualiza el enlace en OBS.", ":material/key:")
+        st.rerun()
+
+    st.markdown("#### 2. Conecta tu canal de Twitch")
+    with st.form("twitch_form"):
+        channel = st.text_input("Nombre de tu canal", me.get("twitch_channel") or "", placeholder="tu_canal")
+        a, b = st.columns(2)
+        client_id = a.text_input("Client ID de Twitch", me.get("twitch_client_id") or "")
+        token = b.text_input("Token de acceso", me.get("twitch_token") or "", type="password",
+                             help="Token de usuario con el permiso channel:read:redemptions.")
+        c, d, e = st.columns([1.2, 1, 1.2])
+        chat_on = c.toggle("Activar también comandos de chat", bool(me.get("chat_enabled")))
+        prefix = d.text_input("Comando", me.get("chat_prefix") or "!sonido", max_chars=20)
+        cooldown = e.slider("Espera entre usos del mismo sonido (s)", 0, 60, int(me.get("obs_cooldown") or 5))
+        if st.form_submit_button("Guardar conexión", type="primary", icon=":material/save:"):
+            update_stream_settings(me["id"], twitch_channel=channel.strip().lstrip("#"),
+                                   twitch_client_id=client_id.strip(), twitch_token=token.strip(),
+                                   chat_enabled=int(chat_on), chat_prefix=prefix.strip() or "!sonido",
+                                   obs_cooldown=cooldown)
+            flash("Conexión con Twitch guardada. Actualiza la fuente en OBS.", ":material/cast:")
+            st.rerun()
+    with st.expander("¿Cómo consigo el Client ID y el token?", icon=":material/help:"):
+        st.markdown(
+            "1. Entra a **dev.twitch.tv/console**, crea una aplicación y copia su **Client ID**.\n"
+            "2. Genera un **token de usuario** con el permiso `channel:read:redemptions`, por ejemplo con "
+            "Twitch CLI: `twitch token -u -s channel:read:redemptions`.\n"
+            "3. Pega ambos datos aquí. Los tokens de Twitch vencen; si el overlay deja de reaccionar, genera uno "
+            "nuevo.\n\n"
+            "Los comandos de chat no necesitan token: cualquiera en tu chat puede escribir "
+            f"`{esc(me.get('chat_prefix') or '!sonido')} nombre del botón`.")
+
+    st.markdown("#### 3. Crea las recompensas con el mismo nombre")
+    st.caption("En Twitch → Panel de creador → Puntos del canal, crea una recompensa por cada sonido con el "
+               "nombre exacto del botón (no importan mayúsculas ni tildes). Al canjearla, el sonido suena en OBS.")
+    prefix = me.get("chat_prefix") or "!sonido"
+    st.dataframe([{"Botón / recompensa": b["name"], "Comando de chat": f"{prefix} {b['name']}"} for b in buttons],
+                 hide_index=True, width="stretch")
+
+
+OVERLAY_CSS = """
+<style>
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: transparent !important; }
+[data-testid="stHeader"], [data-testid="stSidebar"], [data-testid="stToolbar"], [data-testid="stDecoration"],
+[data-testid="stStatusWidget"], [data-testid="stSidebarCollapsedControl"], footer { display: none !important; }
+.block-container { padding: 0 !important; max-width: none !important; }
+</style>
+"""
+
+
+def render_overlay(token: str, test: bool) -> None:
+    st.markdown(OVERLAY_CSS, unsafe_allow_html=True)
+    u = user_by_obs_token(token)
+    if not u or not plan_of(u)["obs"]:
+        st.markdown('<p style="color:#fff;font-family:sans-serif;padding:12px">Este enlace de OBS no es válido o '
+                    'el plan venció.</p>', unsafe_allow_html=True)
+        return
+    payload = [button_payload(b) for b in get_buttons(u["id"])]
+    cfg = {"channel": u.get("twitch_channel") or "", "clientId": u.get("twitch_client_id") or "",
+           "token": u.get("twitch_token") or "", "chat": bool(u.get("chat_enabled")),
+           "prefix": u.get("chat_prefix") or "!sonido", "cooldown": int(u.get("obs_cooldown") or 0), "test": test}
+    show_html(build_overlay_html(payload, cfg), 260)
+
+
 # ================================================================== MAIN
 def main() -> None:
     ensure_default_sounds()
     init_db()
+    obs = st.query_params.get("obs")
+    if obs:  # página que se carga dentro de OBS
+        render_overlay(obs, st.query_params.get("test") == "1")
+        return
     st.markdown(APP_CSS, unsafe_allow_html=True)
     st.session_state.setdefault("stop_nonce", 0)
     if "edit_mode" in st.session_state:  # mantiene el modo edición al ir y volver de otra sección
@@ -1590,14 +2552,20 @@ def main() -> None:
     page = sidebar(me, len(buttons))
     show_flash()
 
-    if page == PAGE_COMMUNITY:
+    if page == PAGE_HOME:
+        page_home(me, buttons)
+    elif page == PAGE_COMMUNITY:
         page_community(me, buttons)
     elif page == PAGE_ADD:
-        page_add(me)
+        page_add(me, len(buttons))
     elif page == PAGE_EDIT:
         page_edit(me, buttons)
     elif page == PAGE_PROFILE:
         page_profile(me)
+    elif page == PAGE_OBS:
+        page_obs(me, buttons)
+    elif page == PAGE_PLANS:
+        page_plans(me)
     else:
         page_pad(me, buttons)
 
