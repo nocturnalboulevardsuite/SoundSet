@@ -1792,10 +1792,18 @@ div[data-baseweb="tab-list"] button[aria-selected="true"] p { color: #ffa04d; }
 @media (prefers-reduced-motion: reduce) { .ss-bubble { animation: none; } }
 .ss-hero { padding: .4rem 0 1rem; }
 .ss-hero h1 { display: inline-block; font-size: 3rem; font-weight: 800; letter-spacing: -1.5px; margin: 0; padding: 0;
-  background: linear-gradient(90deg, #e53935, #ff6d00, #f9b800, #2e9e4f, #1e6fe0, #8e24aa, #e91e7a);
-  -webkit-background-clip: text; background-clip: text; color: transparent; }
+  background: linear-gradient(90deg, #e53935, #ff6d00, #ffb300, #ffd54f, #ff8f00, #ff3d00, #e53935);
+  background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: ss-fire 4s linear infinite; filter: drop-shadow(0 0 18px rgba(255, 109, 0, .25)); }
+@keyframes ss-fire { to { background-position: 300% 0; } }
 .ss-dots { display: flex; gap: 6px; margin: .2rem 0 .6rem; }
-.ss-dots i { width: 14px; height: 14px; border-radius: 50%; display: block; opacity: .85; }
+.ss-dots i { width: 14px; height: 14px; border-radius: 50%; display: block;
+  animation: ss-dot-fire 2.4s ease-in-out infinite; animation-delay: calc(var(--i) * -.27s); }
+@keyframes ss-dot-fire {
+  0%, 100% { background: #e53935; box-shadow: 0 0 8px rgba(229, 57, 53, .6); transform: translateY(0); }
+  33% { background: #ff6d00; box-shadow: 0 0 8px rgba(255, 109, 0, .6); transform: translateY(-3px); }
+  66% { background: #ffc107; box-shadow: 0 0 8px rgba(255, 193, 7, .6); transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .ss-hero h1, .ss-dots i { animation: none; } }
 .ss-badge { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600;
   background: #2a211c; color: #d9cfc6; border: 1px solid #3a2e27; }
 .ss-badge.orange { background: #ff6a00; color: #1a1613; border-color: #ff6a00; }
@@ -2859,7 +2867,7 @@ def messages_view(me: dict) -> None:
 
 
 def page_home(me: dict, buttons: list[dict]) -> None:
-    dots = "".join(f'<i style="background:{c}"></i>' for c in BUBBLE_COLORS)
+    dots = "".join(f'<i style="--i:{i}"></i>' for i in range(9))
     st.markdown(f'<div class="ss-hero"><div class="ss-dots">{dots}</div><h1>Imaginación</h1>'
                 '<p class="ss-muted">Describe el sonido que imaginas y deja que los artistas de SoundSet lo creen '
                 'para ti.</p></div>', unsafe_allow_html=True)
